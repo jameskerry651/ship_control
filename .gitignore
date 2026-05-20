@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境（勿写 env/ 或 ENV/，macOS 会与 env/ Python 包冲突）
+.venv/
+venv/
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# 类型检查
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# 训练产物
+checkpoints/
+runs/
+exports/
+*.pt
+*.pth
+*.ckpt
+
+# 可视化 / 测试输出图
+tests/*.png
+tests/*.pdf
+exports/
+*.mp4
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 环境变量 / 密钥
+.env
+.env.*
+!.env.example
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS / Windows
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 本地工具配置
+.claude/settings.local.json
+
+# Matplotlib 字体缓存
+.matplotlib/
