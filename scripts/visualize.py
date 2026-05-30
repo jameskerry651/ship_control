@@ -371,9 +371,9 @@ def _draw_hud(surf: pygame.Surface, snap: dict, ep_ret: float,
 
 class TugChartHistory:
     LABELS = ["Heading/\u03c0", "Port Az", "Stbd Az", "Port RPM", "Stbd RPM",
-              "DCPA min", "TCPA near", "r_escort", "dist/slot"]
+              "DCPA min", "TCPA near", "r_target", "dist/slot"]
     UNITS  = ["\u00d7\u03c0 rad", "norm", "norm", "norm", "norm",
-              "m", "s", "\u00d70.5", "\u00d7tol"]
+              "m", "s", "raw", "\u00d7tol"]
 
     def __init__(self, maxlen: int = CHART_HISTORY) -> None:
         self.maxlen = maxlen
@@ -391,7 +391,7 @@ class TugChartHistory:
         self.series[4].append(ctrl["starboard_rpm_actual"] / rpm_limit)
         self.series[5].append(min(dcpa_min / 100.0, 1.0))
         self.series[6].append(math.tanh(tcpa_near / 60.0))
-        self.series[7].append(min(tug_data.get("r_escort", 0.0) / 0.5, 1.0))
+        self.series[7].append(float(np.clip(tug_data.get("r_target", 0.0), -1.0, 1.0)))
         self.series[8].append(min(tug_data.get("dist_to_slot", 0.0) / max(self.pos_tol_m, 1e-3), 2.0))
 
     def clear(self) -> None:
@@ -609,17 +609,9 @@ def run_visualization(
                 setattr(env_cfg, key, value)
         if ckpt_env_cfg:
             if "tug_init_mode" not in ckpt_env_cfg:
-                env_cfg.tug_init_mode = "astern_approach"
-            if "obs_include_route" not in ckpt_env_cfg:
-                env_cfg.obs_include_route = False
-            if "route_planner" not in ckpt_env_cfg:
-                env_cfg.route_planner = "manual"
+                env_cfg.tug_init_mode = "mixed_slot_approach"
             if "ship_size_randomize" not in ckpt_env_cfg:
                 env_cfg.ship_size_randomize = False
-            if "obs_include_ship_size" not in ckpt_env_cfg:
-                env_cfg.obs_include_ship_size = False
-            if "obs_include_ego_accel" not in ckpt_env_cfg:
-                env_cfg.obs_include_ego_accel = False
 
         ppo_cfg = PPOConfig()
         for key, value in checkpoint.get("ppo_cfg", {}).items():
@@ -627,51 +619,30 @@ def run_visualization(
                 setattr(ppo_cfg, key, value)
 
         state = checkpoint["model"]
-        if "actor_trunk.0.weight" not in state:
-            raise RuntimeError("checkpoint does not contain MAPPO actor weights")
-        actual_obs_dim = int(state["actor_trunk.0.weight"].shape[1])
+        ckpt_model_kwargs = checkpoint.get("model_kwargs", {})
+        actual_obs_dim = int(ckpt_model_kwargs.get("obs_dim", 0) or 0)
+        if actual_obs_dim <= 0:
+            if "actor_trunk.0.weight" in state:
+                actual_obs_dim = int(state["actor_trunk.0.weight"].shape[1])
+            elif "actor.own_encoder.0.weight" in state:
+                actual_obs_dim = int(state["actor.own_encoder.0.weight"].shape[1]) + 15
+            else:
+                raise RuntimeError("checkpoint does not contain recognizable MAPPO actor weights")
         dummy_env = FormationEnv(cfg=env_cfg)
-        if actual_obs_dim != dummy_env.obs_dim:
-            for flag in (
-                "obs_include_ego_accel",
-                "obs_include_ship_size",
-                "obs_include_cpa_ship",
-                "obs_include_cpa",
-                "obs_include_route",
-                "obs_include_slot_onehot",
-            ):
-                if actual_obs_dim == dummy_env.obs_dim:
-                    break
-                if getattr(env_cfg, flag, False):
-                    setattr(env_cfg, flag, False)
-                    dummy_env = FormationEnv(cfg=env_cfg)
         if actual_obs_dim != dummy_env.obs_dim:
             raise RuntimeError(
                 f"checkpoint obs_dim={actual_obs_dim}, env obs_dim={dummy_env.obs_dim}; "
                 "cannot match observation dimensions"
             )
 
-        critic_hidden = ppo_cfg.critic_hidden_dims
         critic_in_dim: int | None = None
-        if "critic.0.weight" in state:
-            c_hidden: list[int] = []
-            ci = 0
-            while f"critic.{ci}.weight" in state:
-                c_hidden.append(int(state[f"critic.{ci}.weight"].shape[0]))
-                ci += 2
-            if c_hidden and c_hidden[-1] <= 8:
-                c_hidden.pop()
-            if c_hidden:
-                critic_hidden = tuple(c_hidden)
-            critic_in_dim = int(state["critic.0.weight"].shape[1])
+        critic_prefix = "critic.critic" if "critic.critic.0.weight" in state else "critic"
+        if f"{critic_prefix}.0.weight" in state:
+            critic_in_dim = int(state[f"{critic_prefix}.0.weight"].shape[1])
         policy = MAPPOActorCritic(
             obs_dim=actual_obs_dim,
             action_dim=dummy_env.action_dim,
             n_agents=env_cfg.n_tugs,
-            hidden_dims=ppo_cfg.hidden_dims,
-            critic_hidden_dims=critic_hidden,
-            activation=ppo_cfg.activation,
-            log_std_init=ppo_cfg.log_std_init,
             global_state_dim=critic_in_dim,
         )
         policy.load_state_dict(state)

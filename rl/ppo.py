@@ -2,63 +2,20 @@
 
 设计要点：
 - Actor 只看单 agent 局部观察；Critic 看 canonical global state。
-- 高斯策略经 tanh 压到 [-1, 1]，log_std 为可学习参数。
 - 4 个智能体共享同一份 actor（参数共享），观察都是"以自身为参考系"的相对量。
 - 训练时把 (T, N, n_tugs, *) 展平到 (T*N*n_tugs, *) 处理。
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Normal
 
-
-_ACTION_SQUASH_EPS = 1e-6
-
-
-def _atanh(x: torch.Tensor) -> torch.Tensor:
-    """Stable inverse tanh for values in (-1, 1)."""
-    x = torch.clamp(x, -1.0 + _ACTION_SQUASH_EPS, 1.0 - _ACTION_SQUASH_EPS)
-    return 0.5 * (torch.log1p(x) - torch.log1p(-x))
-
-
-def _squash_log_det(action: torch.Tensor) -> torch.Tensor:
-    """Log absolute det of tanh Jacobian, summed over action dims."""
-    action = torch.clamp(action, -1.0 + _ACTION_SQUASH_EPS, 1.0 - _ACTION_SQUASH_EPS)
-    return torch.log(torch.clamp(1.0 - action.pow(2), min=_ACTION_SQUASH_EPS)).sum(dim=-1)
-
-
-class _SquashedDiagonalGaussian:
-    """Diagonal Gaussian policy with tanh squash to [-1, 1]."""
-
-    def __init__(self, mean: torch.Tensor, log_std: torch.Tensor) -> None:
-        self.mean = mean
-        self.std = log_std.exp().expand_as(mean)
-        self.base = Normal(mean, self.std)
-
-    def sample(self, deterministic: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pre_tanh = self.mean if deterministic else self.base.rsample()
-        action = torch.tanh(pre_tanh)
-        logprob = self.base.log_prob(pre_tanh).sum(dim=-1) - _squash_log_det(action)
-        entropy = self.base.entropy().sum(dim=-1)
-        return action, logprob, entropy
-
-    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
-        action = torch.clamp(action, -1.0 + _ACTION_SQUASH_EPS, 1.0 - _ACTION_SQUASH_EPS)
-        pre_tanh = _atanh(action)
-        return self.base.log_prob(pre_tanh).sum(dim=-1) - _squash_log_det(action)
-
-    def entropy(self) -> torch.Tensor:
-        # Exact tanh-Gaussian entropy is not analytic here; use the base Gaussian entropy
-        # as a stable surrogate for PPO regularization.
-        return self.base.entropy().sum(dim=-1)
+from rl.actor import MAPPOActor
+from rl.critic import MAPPOCritic
 
 
 class MAPPOActorCritic(nn.Module):
@@ -67,8 +24,6 @@ class MAPPOActorCritic(nn.Module):
     Actor 只看单个拖轮的局部观察 o_i，执行时不依赖其他 agent。
     Critic 看一份与 agent 无关的 canonical global state（由 env.get_global_state()
     给出，量都在大船船体系下表达），并输出每个 agent 的 V_i(s)。
-
-    Critic 输入为 env.get_global_state() 给出的 canonical global state。
     """
 
     def __init__(
@@ -76,76 +31,40 @@ class MAPPOActorCritic(nn.Module):
         obs_dim: int,
         action_dim: int,
         n_agents: int,
-        hidden_dims: Sequence[int] = (256, 256),
-        critic_hidden_dims: Sequence[int] | None = None,
-        activation: str = "tanh",
-        log_std_init: float = -0.5,
         global_state_dim: int | None = None,
     ) -> None:
         super().__init__()
-        act_cls = {"tanh": nn.Tanh, "relu": nn.ReLU, "gelu": nn.GELU}[activation]
-        critic_hidden_dims = tuple(critic_hidden_dims or hidden_dims)
+        if global_state_dim is None:
+            raise ValueError("global_state_dim is required for MAPPO critic")
 
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.n_agents = n_agents
-        if global_state_dim is None:
-            raise ValueError("global_state_dim is required for MAPPO critic")
         self.global_state_dim = int(global_state_dim)
 
-        actor_layers: list[nn.Module] = []
-        in_dim = obs_dim
-        for h in hidden_dims:
-            actor_layers.append(nn.Linear(in_dim, h))
-            actor_layers.append(act_cls())
-            in_dim = h
-        self.actor_trunk = nn.Sequential(*actor_layers)
-        self.policy_mean = nn.Linear(in_dim, action_dim)
-        self.log_std = nn.Parameter(torch.full((action_dim,), float(log_std_init)))
+        self.actor = MAPPOActor(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+        )
+        self.critic = MAPPOCritic(
+            global_state_dim=self.global_state_dim,
+            n_agents=n_agents,
+        )
 
-        critic_layers: list[nn.Module] = []
-        in_dim = self.global_state_dim
-        for h in critic_hidden_dims:
-            critic_layers.append(nn.Linear(in_dim, h))
-            critic_layers.append(act_cls())
-            in_dim = h
-        critic_layers.append(nn.Linear(in_dim, n_agents))
-        self.critic = nn.Sequential(*critic_layers)
-
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        for m in self.actor_trunk.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=math.sqrt(2.0))
-                nn.init.zeros_(m.bias)
-        nn.init.orthogonal_(self.policy_mean.weight, gain=0.01)
-        nn.init.zeros_(self.policy_mean.bias)
-
-        for m in self.critic.modules():
-            if isinstance(m, nn.Linear):
-                gain = 1.0 if m.out_features == self.n_agents else math.sqrt(2.0)
-                nn.init.orthogonal_(m.weight, gain=gain)
-                nn.init.zeros_(m.bias)
+    @property
+    def log_std(self) -> torch.Tensor:
+        return self.actor.log_std
 
     def policy(self, obs: torch.Tensor) -> torch.Tensor:
-        h = self.actor_trunk(obs)
-        return self.policy_mean(h)
+        return self.actor.policy(obs)
 
     def get_values(self, global_state: torch.Tensor) -> torch.Tensor:
-        """返回集中式 critic 的 value，形状 (..., n_agents)。"""
-        leading_shape = global_state.shape[:-1]
-        flat = global_state.reshape(-1, self.global_state_dim)
-        values = self.critic(flat)
-        return values.reshape(*leading_shape, self.n_agents)
+        return self.critic.get_values(global_state)
 
     def act(
         self, obs: torch.Tensor, deterministic: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        mean = self.policy(obs)
-        dist = _SquashedDiagonalGaussian(mean, self.log_std)
-        action, logprob, _ = dist.sample(deterministic=deterministic)
-        return action, logprob, None
+        return self.actor.act(obs, deterministic=deterministic)
 
     def evaluate_for_agents(
         self,
@@ -154,11 +73,8 @@ class MAPPOActorCritic(nn.Module):
         agent_ids: torch.Tensor,
         action: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mean = self.policy(obs)
-        dist = _SquashedDiagonalGaussian(mean, self.log_std)
-        logprob = dist.log_prob(action)
-        entropy = dist.entropy()
-        values_all = self.get_values(global_state)
+        logprob, entropy = self.actor.evaluate_actions(obs, action)
+        values_all = self.critic.get_values(global_state)
         value = values_all.gather(1, agent_ids.long().unsqueeze(1)).squeeze(1)
         return logprob, entropy, value
 
@@ -307,9 +223,34 @@ class PPOUpdateStats:
     approx_kl: float
     clip_frac: float
     explained_variance: float
+    value_loss_collision: float
+    value_loss_noncollision: float
+    explained_variance_collision: float
+    explained_variance_noncollision: float
     grad_norm: float
     learning_rate: float
     log_std_mean: float
+
+
+def _value_diagnostics(
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> tuple[float, float]:
+    """Return raw value MSE loss and EV for a masked rollout subset."""
+    if mask is None:
+        return float("nan"), float("nan")
+    mask = mask.reshape(-1).bool()
+    if int(mask.sum().item()) < 2:
+        return float("nan"), float("nan")
+    y = returns[mask]
+    y_pred = values[mask]
+    value_loss = float(0.5 * (y_pred - y).pow(2).mean().item())
+    var_y = y.var(unbiased=False)
+    if float(var_y.item()) < 1e-8:
+        return value_loss, float("nan")
+    ev = float(1.0 - (y - y_pred).var(unbiased=False) / var_y)
+    return value_loss, ev
 
 
 def mappo_update(
@@ -326,6 +267,8 @@ def mappo_update(
     update_epochs: int,
     target_kl: float,
     policy_coef: float = 1.0,
+    collision_mask: torch.Tensor | None = None,
+    noncollision_mask: torch.Tensor | None = None,
 ) -> PPOUpdateStats:
     """MAPPO 更新：actor 用局部 obs，critic 用 centralized global obs。
 
@@ -340,6 +283,12 @@ def mappo_update(
     all_values = buffer.values.reshape(-1)
     var_y = all_returns.var(unbiased=False).clamp_min(1e-8)
     explained_variance = float(1.0 - (all_returns - all_values).var(unbiased=False) / var_y)
+    value_loss_collision, ev_collision = _value_diagnostics(
+        all_returns, all_values, collision_mask
+    )
+    value_loss_noncollision, ev_noncollision = _value_diagnostics(
+        all_returns, all_values, noncollision_mask
+    )
 
     stop_early = False
     for _ in range(update_epochs):
@@ -398,6 +347,10 @@ def mappo_update(
         approx_kl=float(np.mean(kls)) if kls else 0.0,
         clip_frac=float(np.mean(clip_fracs)) if clip_fracs else 0.0,
         explained_variance=explained_variance,
+        value_loss_collision=value_loss_collision,
+        value_loss_noncollision=value_loss_noncollision,
+        explained_variance_collision=ev_collision,
+        explained_variance_noncollision=ev_noncollision,
         grad_norm=float(np.mean(gnorms)) if gnorms else 0.0,
         learning_rate=lr,
         log_std_mean=float(model.log_std.detach().mean().item()),

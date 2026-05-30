@@ -22,7 +22,7 @@ class EnvConfig:
     # 大船尺度（典型集装箱船）
     ship_length_m: float = 200.0
     ship_beam_m: float = 30.0
-    ship_size_randomize: bool = True
+    ship_size_randomize: bool = False
     ship_length_min_m: float = 180.0
     ship_length_max_m: float = 240.0
     ship_beam_min_m: float = 26.0
@@ -30,7 +30,7 @@ class EnvConfig:
 
     # 大船速度/航向变化范围
     ship_speed_min: float = 0.5
-    ship_speed_max: float = 2.0
+    ship_speed_max: float = 1.0
     ship_yaw_rate_max: float = 0.02       # rad/s
     ship_speed_tau_s: float = 15.0        # 速度变化的一阶时间常数
     ship_yaw_tau_s: float = 20.0          # 航向角速度变化的一阶时间常数
@@ -38,172 +38,120 @@ class EnvConfig:
     ship_target_resample_max_s: float = 40.0
 
     # Slot 在大船船体系下的偏移（船首/船尾 + 左舷/右舷）
-    slot_lon_offset_m: float = 30.0       # slot 距船首/船尾的纵向距离
-    slot_lat_offset_m: float = 35.0       # slot 距船舷的横向净距；缓解 stern/starboard final-slot 船体碰撞
+    slot_lon_offset_m: float = 20.0       # slot 距船首/船尾的纵向距离
+    slot_lat_offset_m: float = 25.0       # slot 距船舷的横向净距；缓解 stern/starboard final-slot 船体碰撞
 
-    # 拖轮初始位置模式：
-    # - astern_approach：真实任务主模式，拖轮从大船船尾后方带初速追赶，再绕行就位
-    # - mixed_slot_approach：鲁棒性课程；随机 1/2/3 艘已合理就位，其余从路线周围随机绕行
-    tug_init_mode: str = "astern_approach"
+    # 拖轮初始位置模式：当前仅保留 mixed_slot_approach。
+    # 它覆盖 0/1/2/3 艘拖轮已就位，以及未就位拖轮从多种安全区域起步。
+    tug_init_mode: str = "mixed_slot_approach"
 
-    # astern_approach：初始点在船尾后方、左右舷航道上，单位都是大船船体系。
-    # 同侧两艘拖轮分层：船尾 slot 走内侧/更靠前，船首 slot 走外侧/更靠后，
-    # 避免开局和第一个 stern gate 共线汇聚造成拖轮互撞。
-    tug_init_astern_stern_dist_min_m: float = 120.0
-    tug_init_astern_stern_dist_max_m: float = 180.0
-    tug_init_astern_bow_dist_min_m: float = 260.0
-    tug_init_astern_bow_dist_max_m: float = 380.0
-    tug_init_astern_lateral_jitter_m: float = 6.0
-    tug_init_pair_min_dist_m: float = 110.0
-    tug_init_speed_boost_min_ms: float = 0.1     # 初始速度比大船快的范围；过大会诱导远距离高速追赶
-    tug_init_speed_boost_max_ms: float = 0.45
-    tug_init_heading_noise_rad: float = math.radians(12.0)
-    tug_init_sway_noise_ms: float = 0.08
-    tug_init_yaw_rate_noise_rads: float = 0.01
-    tug_init_forward_action: float = 0.25        # 初始推进器前进指令，避免"有速度但油门为零"
+    # 未就位拖轮在船尾后方区域（rear_lane）采样时的纵向距离（大船船体系，按目标 slot 分层）。
+    # 船尾 slot 起得更近，船首 slot 起得更远，减少同侧拖轮开局共线汇聚。
+    tug_init_rear_stern_slot_dist_min_m: float = 80.0   # 目标 slot 为船尾：距船尾端面纵向距离下限（米）
+    tug_init_rear_stern_slot_dist_max_m: float = 200.0   # 目标 slot 为船尾：距船尾端面纵向距离上限（米）
+    tug_init_rear_bow_slot_dist_min_m: float = 260.0       # 目标 slot 为船首：距船尾端面纵向距离下限（米）
+    tug_init_rear_bow_slot_dist_max_m: float = 380.0       # 目标 slot 为船首：距船尾端面纵向距离上限（米）
+    tug_init_speed_boost_min_ms: float = 0.1               # 未就位拖轮纵向速度相对大船的下限增益（m/s）
+    tug_init_speed_boost_max_ms: float = 0.45              # 同上上限；过大易诱发远距离高速追赶
+    tug_init_heading_noise_rad: float = math.radians(3.0) # 初始航向相对速度方向的随机偏差（弧度）
+    tug_init_sway_noise_ms: float = 0.0                   # 船体系横向速度扰动幅度（m/s）
+    tug_init_yaw_rate_noise_rads: float = 0.0             # 初始艏摇角速度扰动幅度（rad/s）
+    tug_init_forward_action: float = 0.25                  # 初始推进器前进指令，避免"有速度但油门为零"
 
-    # mixed_slot_approach：部分拖轮已经以接近 slot 保持状态起步，剩余拖轮从
-    # 船尾/舷侧路线不同阶段随机起步，用于提升策略对非统一初态的鲁棒性。
-    # ready_count=3 时，剩余 1 艘会被放到目标 slot 的对侧船尾外侧，迫使其学习绕行。
-    tug_init_mixed_ready_counts: tuple[int, ...] = (1, 2, 3)
-    tug_init_mixed_pair_min_dist_m: float = 120.0
-    tug_init_ready_outward_offset_m: float = 18.0
-    tug_init_ready_pos_jitter_m: float = 2.0
-    tug_init_ready_heading_noise_rad: float = math.radians(5.0)
-    tug_init_ready_speed_noise_ms: float = 0.12
-    tug_init_ready_sway_noise_ms: float = 0.03
-    tug_init_ready_yaw_rate_noise_rads: float = 0.004
-    tug_init_ready_forward_action: float = 0.22
-    tug_init_mixed_route_longitudinal_jitter_m: float = 18.0
-    tug_init_mixed_route_lateral_jitter_m: float = 20.0
-    tug_init_mixed_opposite_stern_dist_min_m: float = 220.0
-    tug_init_mixed_opposite_stern_dist_max_m: float = 420.0
-    tug_init_mixed_opposite_lateral_extra_m: float = 35.0
+    # mixed_slot_approach：0/1/2/3 艘拖轮已经以接近 slot 保持状态起步，
+    # 剩余拖轮从船尾、舷侧、目标 slot 外侧或对侧船尾等区域随机起步，
+    # 用于提升策略对非统一初态的鲁棒性。
+    tug_init_mixed_ready_counts: tuple[int, ...] = (0, 1, 2, 3)  # reset 时随机抽取的已就位拖轮数量候选
+    tug_init_mixed_pair_min_dist_m: float = 120.0              # 初态采样时拖轮间最小间距（米）；与 2×tug_collision_dist 取较大值
+    tug_init_ready_outward_offset_m: float = 18.0              # 已就位拖轮相对目标 slot 向舷外侧基准偏移（船体系横向，米）
+    tug_init_ready_pos_jitter_m: float = 2.0                   # 已就位拖轮在 slot 附近的平面位置随机扰动幅度（米）
+    tug_init_ready_heading_noise_rad: float = math.radians(5.0) # 已就位拖轮航向相对跟踪方向的随机偏差（弧度）
+    tug_init_ready_speed_noise_ms: float = 0.12                  # 已就位拖轮纵向速度相对大船的扰动幅度（m/s）
+    tug_init_ready_sway_noise_ms: float = 0.03                   # 已就位拖轮船体系横向速度扰动幅度（m/s）
+    tug_init_ready_yaw_rate_noise_rads: float = 0.004            # 已就位拖轮艏摇角速度扰动幅度（rad/s）
+    tug_init_ready_forward_action: float = 0.22                  # 已就位拖轮初始前进油门；其 jitter 为 tug_init_action_jitter 的一半
+    tug_init_mixed_route_longitudinal_jitter_m: float = 18.0   # 未就位拖轮在 rear/gate/opposite 等区域的纵向采样扰动（米）
+    tug_init_mixed_route_lateral_jitter_m: float = 20.0        # 未就位拖轮在上述区域的横向采样扰动（米）
+    tug_init_mixed_approach_speed_min_ms: float = 0.20         # 未就位拖轮朝 route 目标点缓慢接近时的速度下限（m/s）
+    tug_init_mixed_approach_speed_max_ms: float = 0.80         # 同上上限；过大易开局远距离高速追赶
+    tug_init_mixed_opposite_stern_dist_min_m: float = 220.0    # opposite_stern 区：距船尾端面纵向距离下限（米）
+    tug_init_mixed_opposite_stern_dist_max_m: float = 420.0    # opposite_stern 区：距船尾端面纵向距离上限（米）
+    tug_init_mixed_opposite_lateral_extra_m: float = 35.0      # opposite_stern 区：相对本侧航道横向额外外扩（米）
+    tug_init_action_jitter: float = 0.04                       # 混合初态前进油门的均匀随机扰动幅度（未就位用全量，已就位用一半）
 
-    # astern_approach 路线：默认用船体系 visibility planner 生成 waypoint；
-    # 设为 "manual" 使用手写几何模板，便于 ablation。
-    route_planner: str = "visibility"
+    # 每艘拖轮的 route：从 reset 后拖轮位置 A* 到目标 slot（船体系，绕开船体）。
     route_bow_lane_lat_m: float = 100.0
     route_stern_lane_lat_m: float = 60.0
     route_stern_gate_dist_m: float = 60.0
     route_waypoint_tol_m: float = 35.0
     route_lane_min_lat_m: float = 32.0
-    route_chase_speed_target_ms: float = 0.35
     route_chase_speed_max_ms: float = 0.9       # 非 final 阶段相对大船的软追赶速度上限
     route_tug_speed_soft_limit_ms: float = 3.0  # 非 final 阶段拖轮世界速度软上限，抑制远处满油门
-    route_progress_step_clip_m: float = 0.45    # 每控制步最多按该距离计 route progress 奖励
     route_speed_governor: bool = False          # 可选安全层；强限幅会破坏当前策略到达节奏，默认关闭
     route_nonfinal_forward_action_cap: float = 0.45
     route_speed_governor_min_forward_action: float = 0.05
     route_speed_governor_cap_slope: float = 0.30
-    route_tug_spacing_dist_m: float = 90.0
-    route_hull_clearance_m: float = 18.0      # visibility planner 的膨胀船体硬避障距离
     route_outer_holding_extra_m: float = 18.0 # final approach 前保持在 slot 外侧的额外横距
-    route_final_entry_lat_extra_m: float = 22.0
-    route_final_entry_lon_offset_m: float = 12.0
-    route_visibility_node_margin_m: float = 10.0
+    route_astar_cell_m: float = 4.0           # A* 网格分辨率 (m)
+    route_astar_margin_m: float = 10.0        # A* 搜索区域相对起终点的额外边距
+    route_astar_lane_penalty: float = 10_000.0  # 偏离同舷 lane 的软惩罚
+    route_visibility_node_margin_m: float = 10.0  # 兼容旧配置名
     route_min_waypoint_spacing_m: float = 2.0
-    # v39: waypoint 路径泛化
-    route_anchor_jitter: bool = True         # P0: 每 episode 对锚点加随机抖动
-    route_anchor_jitter_m: float = 10.0      # P0: 抖动幅度基准 (m)，按船体尺寸等比例缩放
-    route_spline_smooth: bool = True         # P1: B-spline 平滑 + 等距重采样
-    route_stagger: bool = True               # P2: 同舷船首/船尾 stern_gate 错峰
-    route_stagger_dist_m: float = 50.0       # P2: 错峰距离 (m)，正=船首靠前, 负=船尾靠后
+    route_num_waypoints: int = 12            # 每条 route 固定点数（弧长等距重采样）；便于 route_stage 归一化
+    route_at_slot_skip_tol_m: float = 30.0   # 起终点距 slot 小于此值时不再绕路规划（避免已就位拖轮出现环形 route）
+    route_spline_smooth: bool = True         # B-spline 平滑 + 等距重采样
 
-    # 到位判定阈值（v20 进一步放宽：让首批 succ 信号能出现）
-    pos_tol_m: float = 60.0               # 50m → 60m，不少拖轮卡在 50-60m 区间
+    # 到位判定阈值
+    pos_tol_m: float = 140.0              # 
     heading_tol_rad: float = math.radians(30.0)
-    speed_tol_ms: float = 3.0             # 2.0 → 3.0，靠近时 speed_err 经常卡在 2 边缘
-    hold_time_s: float = 10.0               # curriculum: 5s -> 10s -> 20s -> 30s 逐步提升稳定伴航时间
+    speed_tol_ms: float = 3.0             # 
+    hold_time_s: float = 1.0              # curriculum: 5s -> 10s -> 20s -> 30s 逐步提升稳定伴航时间
 
     # 安全距离
     tug_collision_dist_m: float = 20.0
     ship_collision_dist_m: float = 6.0
 
     # ---------- 奖励权重 ----------
-    reward_progress_w: float = 0.05       # 从 0.02 提高到 0.05，增强靠近激励
-    reward_route_progress_w: float = 0.06
-    reward_lane_w: float = 0.2
-    reward_chase_speed_w: float = 0.08
-    reward_chase_overspeed_w: float = 0.05  # v57: 0.18→0.05，audit 显示 quadratic 项每步 -2，长 ep 累积 -1200 完全主导 dense reward
-    reward_route_speed_limit_w: float = 0.02  # v57: 0.08→0.02，同上
-    reward_spacing_w: float = 0.25
-    reward_cpa_w: float = 0.18
-    reward_cpa_final_multiplier: float = 2.0
-    reward_cpa_max_penalty: float = 0.75
-    reward_heading_w: float = 0.1
-    reward_smooth_w: float = 0.1
-    reward_jerk_w: float = 0.05
-    reward_mag_w: float = 0.01
-    reward_yaw_rate_w: float = 0.1
-    reward_speed_match_w: float = 0.15    # v25 P3: 0.2→0.15，配合 tanh 压缩降低主导性
-    reward_escort_w: float = 0.5             # v38: 伴航累进奖励，替代乘积 r_zone + arrival_bonus
-    reward_escort_final_multiplier: float = 1.5  # final stage 加强持续伴航，避免只短暂进入 slot
-    reward_arrival_bonus: float = 80.0       # v57: 30→80，拉开 success vs timeout 累积 reward 差距（v50 audit 显示 timeout cum +238 > success cum +15）
-    reward_collision_pen: float = 20.0    # v4 原值（碰撞终止）
-    reward_safety_w: float = 0.3
-    ship_safety_dist_m: float = 18.0      # 非 final 阶段：3 倍船体碰撞阈值开始预警
-    ship_safety_final_dist_m: float = 40.0
-    reward_hull_safety_final_multiplier: float = 3.0
+    # Dense reward:
+    # R = w1 * R_target + w2 * R_velocity + w3 * R_control - w4 * P_collision.
+    reward_target_w: float = 1.0
+    reward_velocity_w: float = 0.25
+    reward_control_w: float = 0.2
+    reward_collision_w: float = 6.0
 
-    # 预测船体安全奖励：在短时未来窗口里检查 tug 轨迹与船体的最小距离，
-    # 让策略更早学会避开"看起来还没撞、但几秒后会贴船"的高速切入。
-    ship_future_safety_horizon_s: float = 14.0
-    ship_future_safety_samples: int = 5
-    ship_future_safety_dist_m: float = 26.0
-    ship_future_safety_final_dist_m: float = 45.0
-    reward_ship_future_safety_w: float = 0.25
-    reward_ship_future_safety_final_multiplier: float = 1.8
-    reward_ship_future_safety_max_penalty: float = 0.9
+    # R_target：远场 chase + 近场 hold。
+    reward_target_progress_clip_m: float = 1.5
+    reward_chase_speed_target_ms: float = 0.8
+    reward_hold_start_m: float = 140.0
+    reward_hold_full_m: float = 20.0
 
-    # v52: 简化 staged reward。保留上方各原子项用于诊断，但训练目标改为：
-    # - 非 final route stage：route progress - overspeed/safety/lane/action risk
-    # - final stage：escort/hold - hull/tug/action risk
-    reward_use_simple_stage: bool = True
-    reward_simple_nonfinal_progress_w: float = 1.0
-    reward_simple_final_escort_w: float = 1.0
-    reward_simple_hold_w: float = 0.2
-    reward_simple_route_chase_w: float = 0.5
-    reward_simple_final_speed_match_w: float = 0.25
-    reward_simple_speed_risk_w: float = 1.0
-    reward_simple_safety_risk_w: float = 1.0
-    reward_simple_hull_risk_cap: float = 1.4
-    reward_simple_tug_risk_cap: float = 1.2
-    reward_simple_safety_risk_cap: float = 1.8
-    reward_simple_lane_w: float = 1.0
-    reward_simple_action_w: float = 1.0
+    # R_velocity：近场强匹配大船线速度和角速度，远场只给弱约束。
+    reward_velocity_gate_m: float = 120.0
+    reward_velocity_speed_scale_ms: float = 3.0
+    reward_velocity_yaw_scale_rads: float = 0.05
 
-    # CPA 风险奖励参数：用于把 v32 的 CPA 观测真正接入训练目标。
-    # DCPA 小且 TCPA 短时给连续惩罚；final approach 阶段用 multiplier 加强。
-    cpa_alert_dist_m: float = 70.0
-    cpa_time_horizon_s: float = 45.0
+    # R_control：动作变化、一阶变化的变化和动作幅值。
+    reward_control_delta_w: float = 1.0
+    reward_control_jerk_w: float = 0.5
+    reward_control_mag_w: float = 0.05
 
-    # 是否在观察中加入"其他拖轮相对位置"
-    obs_include_other_tugs: bool = True
-    # 是否在观察中加入 slot one-hot（4 维）
-    obs_include_slot_onehot: bool = True
-    # 是否加入路线 waypoint/stage 特征
-    obs_include_route: bool = True
+    # P_collision：连续安全 barrier；硬碰撞仍由终端惩罚处理。
+    reward_collision_ship_safe_m: float = 30.0
+    reward_collision_tug_safe_m: float = 60.0
+    ship_safety_dist_m: float = 18.0      # 初始化采样的最小船体安全距离。
 
-    # 是否在观察中加入 CPA 特征（v32）
-    obs_include_cpa: bool = True
-    # 是否在观察中加入 拖轮→大船 CPA 特征（v34）
-    obs_include_cpa_ship: bool = True
-    # 是否在观察中加入大船尺度特征（length/beam 相对基准尺度的偏差；v36）
-    obs_include_ship_size: bool = True
-    # 是否在 actor 观察中加入自身体系加速度（u_dot/v_dot/r_dot；v58）
-    obs_include_ego_accel: bool = True
+    # 终端信号：不参与 dense reward 归一化。
+    reward_arrival_bonus: float = 120.0
+    reward_collision_pen: float = 20.0
+
+    # Actor 观察：4 帧历史（当前 + 过去 3 帧）与 3 个大船中心未来前瞻点。
+    obs_history_k: int = 3
+    obs_ship_preview_times_s: tuple[float, float, float] = (5.0, 10.0, 15.0)
 
 
 # ---------- PPO 网络与训练参数 ----------
 @dataclass
 class PPOConfig:
-    # Actor-Critic 网络结构
-    hidden_dims: tuple[int, ...] = (256, 256)
-    critic_hidden_dims: tuple[int, ...] = (512, 512, 512)   # 集中式 critic 更深更宽，处理 121 维 canonical global state
-    activation: str = "tanh"
-    log_std_init: float = -0.5            # 初始 log std，对应 std≈0.6
-
     # PPO 超参数
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -218,11 +166,12 @@ class PPOConfig:
     rollout_steps: int = 256              # 每个并行环境每次 rollout 收集的步数
     num_envs: int = 8                     # 并行环境数（顺序执行的 vector env）
     minibatch_size: int = 1024            # 一次梯度更新的 mini-batch 大小
-    update_epochs: int = 8                # 一份 rollout 数据上的更新轮数
+    update_epochs: int = 3                # 每轮 rollout 后对同一批数据重复 PPO 更新的 epoch 数
 
-    # 优化器
-    learning_rate: float = 3e-4
-    lr_anneal: bool = True                # 线性退火到 0
+    # 优化器（torch.optim.lr_scheduler.CosineAnnealingLR）
+    learning_rate: float = 5e-5
+    lr_anneal: bool = True                # 是否启用余弦学习率退火
+    lr_min_factor: float = 0.05           # eta_min = learning_rate * lr_min_factor
 
     # 总训练量
     total_steps: int = 5_000_000          # 全局环境步数（含所有 envs 与所有 tugs）
@@ -231,7 +180,7 @@ class PPOConfig:
     log_interval: int = 1
     save_interval: int = 25               # 每 N 次 update 保存一次最近权重
     eval_interval: int = 10               # 每 N 次 update 跑一次评估
-    eval_episodes: int = 64               # v56: 16→64，best 选择更可靠（v55 eval 抖动剧烈）
+    eval_episodes: int = 64               
 
     # 设备
     device: str = "cpu"                   # 一般 CPU 比 MPS 快（小网络）
@@ -243,11 +192,6 @@ class PPOConfig:
 # ---------- 可视化参数 ----------
 @dataclass
 class VizConfig:
-    window_w: int = 1280
-    window_h: int = 800
-    fps: int = 30
     meters_per_pixel: float = 0.6         # 缩放：1 像素对应多少米（小=放大）
     follow_ship: bool = True              # 视角是否跟随大船
-    show_trail: bool = True
-    trail_max_len: int = 800
     show_thrust: bool = True              # 是否绘制推进器力矢量
