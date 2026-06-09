@@ -26,13 +26,7 @@ class MAPPOActorCritic(nn.Module):
     给出，量都在大船船体系下表达），并输出每个 agent 的 V_i(s)。
     """
 
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        n_agents: int,
-        global_state_dim: int | None = None,
-    ) -> None:
+    def __init__(self, obs_dim: int, action_dim: int, n_agents: int, global_state_dim: int | None = None) -> None:
         super().__init__()
         if global_state_dim is None:
             raise ValueError("global_state_dim is required for MAPPO critic")
@@ -61,18 +55,10 @@ class MAPPOActorCritic(nn.Module):
     def get_values(self, global_state: torch.Tensor) -> torch.Tensor:
         return self.critic.get_values(global_state)
 
-    def act(
-        self, obs: torch.Tensor, deterministic: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    def act(self, obs: torch.Tensor, deterministic: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         return self.actor.act(obs, deterministic=deterministic)
 
-    def evaluate_for_agents(
-        self,
-        obs: torch.Tensor,
-        global_state: torch.Tensor,
-        agent_ids: torch.Tensor,
-        action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def evaluate_for_agents(self, obs: torch.Tensor, global_state: torch.Tensor, agent_ids: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logprob, entropy = self.actor.evaluate_actions(obs, action)
         values_all = self.critic.get_values(global_state)
         value = values_all.gather(1, agent_ids.long().unsqueeze(1)).squeeze(1)

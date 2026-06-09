@@ -22,24 +22,24 @@ _NEIGHBOR_OBS_DIM = 5
 _ATTENTION_OBS_DIM = _NEIGHBOR_COUNT * _NEIGHBOR_OBS_DIM
 # Actor 网络结构固定在本模块，避免从训练 config 动态改结构。
 _ACTOR_HIDDEN_DIMS = (256, 256)
-_ACTOR_ACTIVATION = nn.Tanh
+_ACTOR_ACTIVATION = nn.Tanh # 激活函数，把输入映射到 [-1, 1] 区间
 _LOG_STD_INIT = -0.5
 
 
 def _atanh(x: torch.Tensor) -> torch.Tensor:
-    """Stable inverse tanh for values in (-1, 1)."""
+    """对 (-1, 1) 区间内的值做数值稳定的反 tanh。"""
     x = torch.clamp(x, -1.0 + _ACTION_SQUASH_EPS, 1.0 - _ACTION_SQUASH_EPS)
     return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
 
 def _squash_log_det(action: torch.Tensor) -> torch.Tensor:
-    """Log absolute det of tanh Jacobian, summed over action dims."""
+    """根据概率论变量变换定理，计算tanh 动作压缩（squash）带来的对数雅可比修正项，用于稳定训练。"""
     action = torch.clamp(action, -1.0 + _ACTION_SQUASH_EPS, 1.0 - _ACTION_SQUASH_EPS)
     return torch.log(torch.clamp(1.0 - action.pow(2), min=_ACTION_SQUASH_EPS)).sum(dim=-1)
 
 
 class SquashedDiagonalGaussian:
-    """Diagonal Gaussian policy with tanh squash to [-1, 1]."""
+    """对角高斯策略，经 tanh 压缩到 [-1, 1]。"""
 
     def __init__(self, mean: torch.Tensor, log_std: torch.Tensor) -> None:
         self.mean = mean
@@ -47,25 +47,39 @@ class SquashedDiagonalGaussian:
         self.base = Normal(mean, self.std)
 
     def sample(self, deterministic: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        
+        1. 如果 deterministic 为 True，则直接使用均值作为动作。(确定模式，用于评估和可视化)
+        2. 如果 deterministic 为 False，则使用基础高斯分布采样得到动作。（随机模式，用于训练）
+        3. 对动作进行 tanh 压缩。
+        4. 计算修正后的动作对数概率。
+        5. 计算基础高斯熵。
+        6. 返回动作、对数概率和熵。
+        """
         pre_tanh = self.mean if deterministic else self.base.rsample()
         action = torch.tanh(pre_tanh)
-        logprob = self.base.log_prob(pre_tanh).sum(dim=-1) - _squash_log_det(action)
+        logprob = self.base.log_prob(pre_tanh).sum(dim=-1) - _squash_log_det(action) # 计算修正后的动作对数概率
         entropy = self.base.entropy().sum(dim=-1)
         return action, logprob, entropy
 
     def log_prob(self, action: torch.Tensor) -> torch.Tensor:
+        """
+        1. 对动作进行 clamp，确保在 [-1, 1] 区间内。
+        2. 计算修正后的动作对数概率。
+        3. 返回动作对数概率。
+        """
         action = torch.clamp(action, -1.0 + _ACTION_SQUASH_EPS, 1.0 - _ACTION_SQUASH_EPS)
         pre_tanh = _atanh(action)
         return self.base.log_prob(pre_tanh).sum(dim=-1) - _squash_log_det(action)
 
     def entropy(self) -> torch.Tensor:
-        # Exact tanh-Gaussian entropy is not analytic here; use the base Gaussian entropy
-        # as a stable surrogate for PPO regularization.
+        # 此处 tanh-高斯熵无解析闭式；用基础高斯熵作为 PPO 正则化的稳定代理。
+        # 计算智能体动作分布的熵，衡量动作的随机性。熵越大，动作越随机。
         return self.base.entropy().sum(dim=-1)
 
 
 class AttentionCollisionAvoidance(nn.Module):
-    """Single-head scaled dot-product attention over the three neighbour tugs."""
+    """对三艘邻居拖轮做单头缩放点积注意力。"""
 
     def __init__(self, own_feat_dim: int, neigh_feat_dim: int, embed_dim: int = 64) -> None:
         super().__init__()
@@ -76,12 +90,15 @@ class AttentionCollisionAvoidance(nn.Module):
         self.fc_out = nn.Linear(embed_dim, embed_dim)
         self.scale = math.sqrt(float(embed_dim))
 
-    def forward(
-        self,
-        e_own: torch.Tensor,
-        e_neighbors: torch.Tensor,
-        mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, e_own: torch.Tensor, e_neighbors: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        1. 计算自身特征的查询向量。
+        2. 计算邻居特征的键向量和值向量。
+        3. 计算注意力分数。
+        4. 计算注意力权重。
+        5. 计算聚合特征。
+        6. 返回聚合特征和注意力权重。
+        """
         query = self.w_q(e_own).unsqueeze(1)
         key = self.w_k(e_neighbors)
         value = self.w_v(e_neighbors)
@@ -97,13 +114,9 @@ class AttentionCollisionAvoidance(nn.Module):
 class MAPPOActor(nn.Module):
     """去中心化 Actor：只看单个拖轮的局部观察 o_i。"""
 
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-    ) -> None:
+    def __init__(self, obs_dim: int, action_dim: int) -> None:
         super().__init__()
-        act_cls = _ACTOR_ACTIVATION
+        act_cls = _ACTOR_ACTIVATION # 激活函数，把输入映射到 [-1, 1] 区间
 
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -188,9 +201,7 @@ class MAPPOActor(nn.Module):
     def _dist(self, obs: torch.Tensor) -> SquashedDiagonalGaussian:
         return SquashedDiagonalGaussian(self.policy(obs), self.log_std)
 
-    def act(
-        self, obs: torch.Tensor, deterministic: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    def act(self, obs: torch.Tensor, deterministic: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:    
         dist = self._dist(obs)
         action, logprob, _ = dist.sample(deterministic=deterministic)
         return action, logprob, None

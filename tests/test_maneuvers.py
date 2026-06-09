@@ -1,10 +1,13 @@
-"""Z字试验与S形试验。
+"""Z字试验、S形试验与回转试验。
 
 Z字试验（Zigzag maneuver）：经典 IMO 操纵性试验。两侧推进器以固定正转 RPM 前进，
 方位角在 +delta / -delta 之间切换，当航向偏离到 +psi_switch 时翻向负方位角，
 偏离到 -psi_switch 时翻向正方位角，循环若干次。
 
 S形试验（Sinusoidal maneuver）：方位角指令为 sin 波形，船舶在水面上画出 S 形轨迹。
+
+回转试验（Turning circle）：直航预热后以固定方位角持续转向，轨迹近似圆形，
+用于评估回转直径与定常转首速率。
 
 在项目根目录运行: python tests/test_maneuvers.py
 """
@@ -29,6 +32,9 @@ from physics.tugboat_dynamics_model import TugboatDynamicsModel
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent
+
+# 默认巡航转速（约 5 kn 稳态），较原先 150–180 RPM 明显放慢
+DEFAULT_RPM_CRUISE = 90.0
 
 
 @dataclass
@@ -71,7 +77,7 @@ def _record(log: TestLog, t: float, model: TugboatDynamicsModel) -> None:
 def run_zigzag(
     delta_deg: float = 15.0,
     psi_switch_deg: float = 10.0,
-    rpm_cruise: float = 150.0,
+    rpm_cruise: float = DEFAULT_RPM_CRUISE,
     duration_s: float = 300.0,
     dt: float = 0.05,
     warmup_s: float = 20.0,
@@ -112,8 +118,8 @@ def run_zigzag(
 
 def run_sinusoidal(
     amplitude_deg: float = 25.0,
-    period_s: float = 60.0,
-    rpm_cruise: float = 180.0,
+    period_s: float = 90.0,
+    rpm_cruise: float = DEFAULT_RPM_CRUISE,
     duration_s: float = 240.0,
     dt: float = 0.05,
     warmup_s: float = 15.0,
@@ -134,6 +140,41 @@ def run_sinusoidal(
         else:
             az_cmd = amplitude_deg * math.sin(omega * (t - warmup_s))
 
+        model.set_control_commands(rpm_cruise, rpm_cruise, az_cmd, az_cmd)
+        model.step(dt)
+        _record(log, t, model)
+
+    return log
+
+
+def run_turning_circle(
+    delta_deg: float = 20.0,
+    rpm_cruise: float = DEFAULT_RPM_CRUISE,
+    duration_s: float = 300.0,
+    dt: float = 0.05,
+    warmup_s: float = 30.0,
+    turn_direction: str = "starboard",
+) -> TestLog:
+    """回转试验：直航预热后以固定方位角持续转向。
+
+    在本动力学约定下，方位角与偏航力矩反号（正方位角 → 负偏航）。
+    starboard（右转）取负方位角，port（左转）取正方位角。
+    """
+    model = TugboatDynamicsModel()
+    model.reset()
+
+    direction = turn_direction.lower()
+    if direction.startswith("p"):
+        az_turn = +delta_deg
+    else:
+        az_turn = -delta_deg
+
+    log = _new_log()
+    n_steps = int(duration_s / dt)
+
+    for i in range(n_steps):
+        t = i * dt
+        az_cmd = 0.0 if t < warmup_s else az_turn
         model.set_control_commands(rpm_cruise, rpm_cruise, az_cmd, az_cmd)
         model.step(dt)
         _record(log, t, model)
@@ -202,7 +243,7 @@ def main() -> None:
     zigzag_log = run_zigzag()
     plot_test(
         zigzag_log,
-        "Z-shape (Zigzag) test — 15° azimuth, ±10° heading switch, 150 RPM",
+        "Z-shape (Zigzag) test — 15° azimuth, ±10° heading switch, 90 RPM",
         os.path.join(OUTPUT_DIR, "zigzag_test.png"),
     )
 
@@ -210,8 +251,16 @@ def main() -> None:
     sine_log = run_sinusoidal()
     plot_test(
         sine_log,
-        "S-shape (Sinusoidal) test — ±25° azimuth, T=60 s, both thrusters at 180 RPM",
+        "S-shape (Sinusoidal) test — ±25° azimuth, T=90 s, both thrusters at 90 RPM",
         os.path.join(OUTPUT_DIR, "s_shape_test.png"),
+    )
+
+    print("running turning circle test ...")
+    turning_log = run_turning_circle()
+    plot_test(
+        turning_log,
+        "Turning circle — 20° azimuth (starboard), 90 RPM",
+        os.path.join(OUTPUT_DIR, "turning_circle_test.png"),
     )
 
 
