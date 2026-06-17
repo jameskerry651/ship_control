@@ -20,9 +20,6 @@ _NEIGHBOR_COUNT = 3
 _NEIGHBOR_OBS_DIM = 5
 # 邻居观测总维度，供 attention 模块输入
 _ATTENTION_OBS_DIM = _NEIGHBOR_COUNT * _NEIGHBOR_OBS_DIM
-# Actor 网络结构固定在本模块，避免从训练 config 动态改结构。
-_ACTOR_HIDDEN_DIMS = (256, 256)
-_ACTOR_ACTIVATION = nn.Tanh # 激活函数，把输入映射到 [-1, 1] 区间
 _LOG_STD_INIT = -0.5
 
 
@@ -116,7 +113,6 @@ class MAPPOActor(nn.Module):
 
     def __init__(self, obs_dim: int, action_dim: int) -> None:
         super().__init__()
-        act_cls = _ACTOR_ACTIVATION # 激活函数，把输入映射到 [-1, 1] 区间
 
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -131,15 +127,15 @@ class MAPPOActor(nn.Module):
 
         self.own_encoder = nn.Sequential(
             nn.Linear(self.own_obs_dim, 128),
-            act_cls(),
+            nn.Tanh(),
             nn.Linear(128, 64),
-            act_cls(),
+            nn.Tanh(),
         )
         self.neigh_encoder = nn.Sequential(
             nn.Linear(self.neighbor_obs_dim, 64),
-            act_cls(),
+            nn.Tanh(),
             nn.Linear(64, 64),
-            act_cls(),
+            nn.Tanh(),
         )
         self.attention_block = AttentionCollisionAvoidance(
             own_feat_dim=64,
@@ -147,14 +143,13 @@ class MAPPOActor(nn.Module):
             embed_dim=64,
         )
 
-        actor_layers: list[nn.Module] = []
-        in_dim = 128
-        for h in _ACTOR_HIDDEN_DIMS:
-            actor_layers.append(nn.Linear(in_dim, h))
-            actor_layers.append(act_cls())
-            in_dim = h
-        self.actor_head = nn.Sequential(*actor_layers)
-        self.policy_mean = nn.Linear(in_dim, action_dim)
+        self.actor_head = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.Tanh(),
+        )
+        self.policy_mean = nn.Linear(256, action_dim)
         self.log_std = nn.Parameter(torch.full((action_dim,), _LOG_STD_INIT))
 
         self._init_weights()
@@ -206,8 +201,7 @@ class MAPPOActor(nn.Module):
         action, logprob, _ = dist.sample(deterministic=deterministic)
         return action, logprob, None
 
-    def evaluate_actions(
-        self, obs: torch.Tensor, action: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def evaluate_actions(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         dist = self._dist(obs)
         return dist.log_prob(action), dist.entropy()
+        

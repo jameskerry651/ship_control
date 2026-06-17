@@ -1,12 +1,12 @@
-"""Dense reward for the tug formation environment.
+"""拖船编队环境的稠密奖励。
 
-The training reward intentionally has a single shape:
+训练奖励有一个有意设计的统一结构：
 
     R = w_target * R_target + w_velocity * R_velocity
         + w_control * R_control - w_collision * P_collision
 
-Terminal success bonuses and hard collision penalties are still handled by
-``FormationEnv.step`` so dense reward normalization does not dilute them.
+终止的成功奖励和严重碰撞惩罚仍然由
+``FormationEnv.step`` 处理，因此稠密奖励的归一化并不会稀释这些奖励。
 """
 
 from __future__ import annotations
