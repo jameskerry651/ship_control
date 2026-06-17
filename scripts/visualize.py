@@ -625,7 +625,9 @@ def run_visualization(
             if "actor_trunk.0.weight" in state:
                 actual_obs_dim = int(state["actor_trunk.0.weight"].shape[1])
             elif "actor.own_encoder.0.weight" in state:
-                actual_obs_dim = int(state["actor.own_encoder.0.weight"].shape[1]) + 15
+                from rl.actor import _NEIGHBOR_COUNT, _NEIGHBOR_OBS_DIM
+                own_in = int(state["actor.own_encoder.0.weight"].shape[1])
+                actual_obs_dim = own_in + _NEIGHBOR_COUNT * _NEIGHBOR_OBS_DIM
             else:
                 raise RuntimeError("checkpoint does not contain recognizable MAPPO actor weights")
         dummy_env = FormationEnv(cfg=env_cfg)

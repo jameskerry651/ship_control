@@ -24,11 +24,6 @@ def demo_attention_collision_avoidance() -> None:
     print("attn_weights shape :", attn_weights.shape)   # [batch, n_neighbors]
     print("attn_weights[0]    :", attn_weights[0].tolist())  # 3 个邻居的注意力权重，和为 1
 
-    # 可选：mask 标记无效邻居槽位（0 = 无邻居）
-    mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
-    _, masked_weights = attn(e_own, e_neighbors, mask=mask)
-    print("masked_weights[0]  :", masked_weights[0].tolist())
-
 
 def test_attention_forward() -> None:
   attn = AttentionCollisionAvoidance(64, 64, embed_dim=64)

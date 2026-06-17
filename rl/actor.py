@@ -16,11 +16,15 @@ _ACTION_SQUASH_EPS = 1e-6
 _OWN_OBS_DIM = 56
 # 参与 attention 的邻居数量
 _NEIGHBOR_COUNT = 3
-# 单个邻居观测维度
-_NEIGHBOR_OBS_DIM = 5
+# 单个邻居观测维度：风险特征 [dx, dy, distance, sin(bearing), cos(bearing),
+# du, dv, range_rate, tcpa, dcpa]，与 env/observer.py 保持一致
+_NEIGHBOR_OBS_DIM = 10
 # 邻居观测总维度，供 attention 模块输入
 _ATTENTION_OBS_DIM = _NEIGHBOR_COUNT * _NEIGHBOR_OBS_DIM
 _LOG_STD_INIT = -0.5
+# log_std 的硬裁剪边界，防止 std 指数爆炸（上界）或熵塌缩（下界）导致训练不稳定
+_LOG_STD_MIN = -5.0
+_LOG_STD_MAX = 2.0
 
 
 def _atanh(x: torch.Tensor) -> torch.Tensor:
@@ -40,6 +44,8 @@ class SquashedDiagonalGaussian:
 
     def __init__(self, mean: torch.Tensor, log_std: torch.Tensor) -> None:
         self.mean = mean
+        # 裁剪 log_std 到安全区间，避免 std 过大（梯度爆炸）或过小（熵塌缩、过早收敛）
+        log_std = torch.clamp(log_std, _LOG_STD_MIN, _LOG_STD_MAX)
         self.std = log_std.exp().expand_as(mean)
         self.base = Normal(mean, self.std)
 
@@ -101,7 +107,7 @@ class AttentionCollisionAvoidance(nn.Module):
         # 缩放因子 sqrt(d_k)，防止点积过大导致 softmax 梯度消失
         self.scale = math.sqrt(float(embed_dim))
 
-    def forward(self, e_own: torch.Tensor, e_neighbors: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, e_own: torch.Tensor, e_neighbors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         1. 计算自身特征的查询向量。
         2. 计算邻居特征的键向量和值向量。
@@ -114,11 +120,13 @@ class AttentionCollisionAvoidance(nn.Module):
         key = self.w_k(e_neighbors)
         value = self.w_v(e_neighbors)
         scores = torch.matmul(query, key.transpose(-2, -1)) / self.scale
-        if mask is not None:
-            scores = scores.masked_fill(mask.unsqueeze(1) == 0, -1e9)
         attn_weights = F.softmax(scores, dim=-1)
         context = torch.matmul(attn_weights, value).squeeze(1)
         agg_feat = self.fc_out(context)
+        """
+        attn_weights 是注意力权重，表示每个邻居对本船的影响程度。
+        agg_feat 是 attention 聚合后的邻居上下文向量，可以理解为：本船根据当前状态，从 3 艘邻居里「加权汇总」出的一份 64 维环境威胁摘要。
+        """
         return agg_feat, attn_weights.squeeze(1)
 
 
@@ -126,6 +134,19 @@ class MAPPOActor(nn.Module):
     """去中心化 Actor：只看单个拖轮的局部观察 o_i。"""
 
     def __init__(self, obs_dim: int, action_dim: int) -> None:
+        """
+        初始化去中心化 Actor 网络。
+
+        整体结构：
+            观测 → [本船编码器 + 邻居编码器] → Attention 聚合 → 拼接特征 → Actor Head → 策略均值
+
+        Parameters
+        ----------
+        obs_dim : int
+            总观测维度，必须等于 _OWN_OBS_DIM + _ATTENTION_OBS_DIM（本船观测 + 邻居观测）。
+        action_dim : int
+            动作空间维度，即策略输出的连续动作分量数。
+        """
         super().__init__()
 
         self.obs_dim = int(obs_dim)
@@ -139,36 +160,52 @@ class MAPPOActor(nn.Module):
                 f"attention actor expects obs_dim={expected_obs_dim}, got {self.obs_dim}"
             )
 
+        # 本船特征编码器：将本船观测 (56维) 编码为 64 维特征向量
         self.own_encoder = nn.Sequential(
             nn.Linear(self.own_obs_dim, 128),
+            nn.LayerNorm(128),
             nn.Tanh(),
             nn.Linear(128, 64),
+            nn.LayerNorm(64),
             nn.Tanh(),
         )
+        # 邻居特征编码器：将单个邻居风险特征 (10维) 编码为 64 维特征向量，供 Attention 模块使用
         self.neigh_encoder = nn.Sequential(
             nn.Linear(self.neighbor_obs_dim, 64),
+            nn.LayerNorm(64),
             nn.Tanh(),
             nn.Linear(64, 64),
             nn.Tanh(),
         )
-        self.attention_block = AttentionCollisionAvoidance(
-            own_feat_dim=64,
-            neigh_feat_dim=64,
-            embed_dim=64,
-        )
+        # 注意力碰撞规避模块：对 3 个邻居做单头缩放点积注意力，输出 64 维环境威胁摘要
+        self.attention_block = AttentionCollisionAvoidance(own_feat_dim=64,neigh_feat_dim=64,embed_dim=64,)
 
+        # Actor 头部网络：将拼接后的 128 维特征 (64本船 + 64威胁摘要) 映射到 256 维隐藏层
         self.actor_head = nn.Sequential(
             nn.Linear(128, 256),
+            nn.LayerNorm(256),
             nn.Tanh(),
             nn.Linear(256, 256),
+            nn.LayerNorm(256),
             nn.Tanh(),
         )
+        # 策略均值头：将 256 维隐藏层映射为 action_dim 维的动作均值
         self.policy_mean = nn.Linear(256, action_dim)
+        # 可学习的对数标准差参数，初始化为 -0.5，用于控制策略的探索幅度
         self.log_std = nn.Parameter(torch.full((action_dim,), _LOG_STD_INIT))
 
         self._init_weights()
 
     def _init_weights(self) -> None:
+        """
+        自定义权重初始化策略。
+
+        - 隐藏层（编码器 + Attention + Actor Head）使用正交初始化 (gain=√2)，
+          配合 Tanh 激活函数，有助于缓解梯度消失/爆炸问题。
+        - 策略均值输出层使用极小增益 (gain=0.01) 的正交初始化，
+          使训练初期策略接近均匀随机，避免过早收敛到次优动作。
+        - 所有偏置初始化为零。
+        """
         for module in (self.own_encoder, self.neigh_encoder, self.attention_block, self.actor_head):
             for m in module.modules():
                 if isinstance(m, nn.Linear):
@@ -178,6 +215,23 @@ class MAPPOActor(nn.Module):
         nn.init.zeros_(self.policy_mean.bias)
 
     def _split_obs(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        将原始观测张量拆分为本船观测和邻居观测。
+
+        观测布局：[own_obs (56维) | neigh_0 (10维) | neigh_1 (10维) | neigh_2 (10维)]
+
+        Parameters
+        ----------
+        obs : torch.Tensor
+            原始观测张量，shape=(..., obs_dim)。
+
+        Returns
+        -------
+        own_obs : torch.Tensor
+            本船观测，shape=(..., 56)。
+        neighbors_obs : torch.Tensor
+            邻居观测，shape=(..., neighbor_count=3, neighbor_obs_dim=10)。
+        """
         own_obs = obs[..., :self.own_obs_dim]
         neigh_flat = obs[..., self.own_obs_dim:]
         neighbors_obs = neigh_flat.reshape(
@@ -186,6 +240,29 @@ class MAPPOActor(nn.Module):
         return own_obs, neighbors_obs
 
     def _features(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        特征提取主流程：编码 → Attention 聚合 → 拼接。
+
+        处理步骤：
+            1. 将输入展平为二维张量以适配网络层。
+            2. 拆分本船观测与邻居观测。
+            3. 分别通过本船编码器和邻居编码器得到特征向量。
+            4. 通过 Attention 模块聚合邻居特征，得到环境威胁摘要。
+            5. 将本船特征与环境威胁摘要拼接为 128 维组合特征。
+            6. 恢复原始 leading shape 后返回。
+
+        Parameters
+        ----------
+        obs : torch.Tensor
+            原始观测张量，shape=(..., obs_dim)。支持任意 leading shape（如 batch、时间步等）。
+
+        Returns
+        -------
+        combined : torch.Tensor
+            组合特征，shape=(..., 128)，由 64 维本船特征和 64 维威胁摘要拼接而成。
+        weights : torch.Tensor
+            注意力权重，shape=(..., neighbor_count=3)，反映每个邻居对当前决策的影响程度。
+        """
         leading_shape = obs.shape[:-1]
         flat_obs = obs.reshape(-1, self.obs_dim)
         own_obs, neighbors_obs = self._split_obs(flat_obs)
@@ -193,29 +270,114 @@ class MAPPOActor(nn.Module):
         n = self.neighbor_count
         e_neigh = self.neigh_encoder(
             neighbors_obs.reshape(-1, self.neighbor_obs_dim)
-        ).reshape(-1, n, 64)
+        ).reshape(-1, n, self.attention_block.embed_dim)
         env_threat_feat, weights = self.attention_block(e_own, e_neigh)
         combined = torch.cat([e_own, env_threat_feat], dim=-1)
         return combined.reshape(*leading_shape, -1), weights.reshape(*leading_shape, n)
 
     def policy(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        计算策略均值（未经 tanh 压缩的 pre-tanh 动作均值）。
+
+        前向流程：obs → 特征提取 → Actor Head → policy_mean
+
+        Parameters
+        ----------
+        obs : torch.Tensor
+            原始观测张量，shape=(..., obs_dim)。
+
+        Returns
+        -------
+        torch.Tensor
+            策略均值，shape=(..., action_dim)。
+        """
         features, _ = self._features(obs)
         h = self.actor_head(features)
         return self.policy_mean(h)
 
     def attention_weights(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        提取当前观测下的注意力权重，用于可视化和分析智能体的碰撞规避决策。
+
+        Parameters
+        ----------
+        obs : torch.Tensor
+            原始观测张量，shape=(..., obs_dim)。
+
+        Returns
+        -------
+        torch.Tensor
+            注意力权重，shape=(..., neighbor_count=3)，
+            每个元素表示对应邻居在决策中的权重占比。
+        """
         _, weights = self._features(obs)
         return weights
 
     def _dist(self, obs: torch.Tensor) -> SquashedDiagonalGaussian:
+        """
+        构造 tanh 压缩的对角高斯策略分布。
+
+        Parameters
+        ----------
+        obs : torch.Tensor
+            原始观测张量。
+
+        Returns
+        -------
+        SquashedDiagonalGaussian
+            经 tanh 压缩到 [-1, 1] 的对角高斯分布，均值由 policy() 计算，
+            标准差由可学习参数 log_std 决定。
+        """
         return SquashedDiagonalGaussian(self.policy(obs), self.log_std)
 
     def act(self, obs: torch.Tensor, deterministic: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:    
+        """
+        采样动作，供环境交互时调用。
+
+        Parameters
+        ----------
+        obs : torch.Tensor
+            当前时刻的观测，shape=(..., obs_dim)。
+        deterministic : bool, optional
+            是否使用确定性模式（直接输出均值），默认 False。
+            - True：用于评估/可视化，输出确定性动作。
+            - False：用于训练，从策略分布中采样以鼓励探索。
+
+        Returns
+        -------
+        action : torch.Tensor
+            采样得到的动作，shape=(..., action_dim)，值域 [-1, 1]。
+        logprob : torch.Tensor
+            动作的对数概率，shape=(...,)，用于 PPO 的重要性比率计算。
+        None
+            占位符（预留隐藏状态接口，当前架构不使用 RNN，故返回 None）。
+        """
         dist = self._dist(obs)
         action, logprob, _ = dist.sample(deterministic=deterministic)
         return action, logprob, None
 
     def evaluate_actions(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        评估给定观测-动作对的对数概率和熵，供 PPO 更新时调用。
+
+        在 PPO 的 on-policy 更新中，需要用当前策略重新评估 rollout 阶段采集的 (obs, action) 对，
+        以计算新旧策略的重要性比率 (ratio = exp(new_logprob - old_logprob)) 和熵正则项。
+
+        Parameters
+        ----------
+        obs : torch.Tensor
+            观测张量，shape=(..., obs_dim)。
+        action : torch.Tensor
+            历史采集的动作，shape=(..., action_dim)，值域应在 [-1, 1] 内。
+
+        Returns
+        -------
+        log_prob : torch.Tensor
+            当前策略下动作的对数概率，shape=(...,)。
+        entropy : torch.Tensor
+            当前策略的熵（使用基础高斯熵近似），shape=(...,)，
+            用于 PPO 的熵正则化损失，鼓励探索。
+        """
         dist = self._dist(obs)
         return dist.log_prob(action), dist.entropy()
         

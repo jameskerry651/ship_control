@@ -1,6 +1,6 @@
 """拖轮编队环境的观测与全局状态构建。
 
-构建每个智能体的71维观测向量，以及用于中心化评论器的121维标准全局状态。
+构建每个智能体的86维观测向量，以及用于中心化评论器的121维标准全局状态。
 """
 
 from __future__ import annotations
@@ -23,7 +23,14 @@ _ACTION_HISTORY_OBS_DIM = ACTION_DIM
 _SHIP_REL_OBS_DIM = 6
 _SHIP_PREVIEW_POINT_DIM = 2
 _NEIGHBOR_COUNT = 3
-_NEIGHBOR_OBS_DIM = 5
+# 单个邻居观测维度：从纯几何状态升级为碰撞风险特征
+# [dx, dy, distance, sin(bearing), cos(bearing), du, dv, range_rate, tcpa, dcpa]
+_NEIGHBOR_OBS_DIM = 10
+
+# TCPA（最近会遇时刻）归一化尺度，单位秒；超过该窗口的会遇被视为低风险
+_NEIGHBOR_TCPA_SCALE_S = 60.0
+# 相对速度模长下限，低于此值认为两船相对静止，TCPA/DCPA 退化为当前距离
+_NEIGHBOR_REL_SPEED_EPS = 1e-6
 
 # --------  global-state dimension constants  --------
 _GLOBAL_SHIP_DIM = 5
@@ -172,11 +179,39 @@ class Observer:
                     float(tug_world_vy[j] - tug_world_vy[i]),
                     tug.eta.z,
                 )
+                # 相对位置与相对速度（拖轮 i 自身坐标系）
+                dist = math.hypot(dx_local, dy_local)
+                # 方位角：邻居相对本船船首的夹角，用 sin/cos 表示避免角度回绕
+                bearing = math.atan2(dy_local, dx_local)
+                # 距离变化率（range rate）= d(distance)/dt，沿视线方向的相对速度投影
+                # 负值代表正在接近，正值代表正在远离
+                if dist > _NEIGHBOR_REL_SPEED_EPS:
+                    range_rate = (dx_local * du_local + dy_local * dv_local) / dist
+                else:
+                    range_rate = 0.0
+                # TCPA / DCPA：基于当前相对位置与相对速度的匀速外推
+                rel_speed_sq = du_local * du_local + dv_local * dv_local
+                if rel_speed_sq > _NEIGHBOR_REL_SPEED_EPS:
+                    # t* = -(r·v) / |v|^2，会遇时刻；过去的会遇（t*<0）裁剪为 0
+                    tcpa = -(dx_local * du_local + dy_local * dv_local) / rel_speed_sq
+                    tcpa = max(tcpa, 0.0)
+                    cpa_x = dx_local + du_local * tcpa
+                    cpa_y = dy_local + dv_local * tcpa
+                    dcpa = math.hypot(cpa_x, cpa_y)
+                else:
+                    # 相对静止：无会遇趋势，DCPA 退化为当前距离，TCPA 视为窗口外
+                    tcpa = _NEIGHBOR_TCPA_SCALE_S
+                    dcpa = dist
                 obs[i, idx + 0] = dx_local / 100.0
                 obs[i, idx + 1] = dy_local / 100.0
-                obs[i, idx + 2] = du_local / 5.0
-                obs[i, idx + 3] = dv_local / 5.0
-                obs[i, idx + 4] = min(math.hypot(dx_w, dy_w) / 100.0, 10.0)
+                obs[i, idx + 2] = min(dist / 100.0, 10.0)
+                obs[i, idx + 3] = math.sin(bearing)
+                obs[i, idx + 4] = math.cos(bearing)
+                obs[i, idx + 5] = du_local / 5.0
+                obs[i, idx + 6] = dv_local / 5.0
+                obs[i, idx + 7] = range_rate / 5.0
+                obs[i, idx + 8] = min(tcpa / _NEIGHBOR_TCPA_SCALE_S, 10.0)
+                obs[i, idx + 9] = min(dcpa / 100.0, 10.0)
                 idx += _NEIGHBOR_OBS_DIM
 
         np.clip(obs, -10.0, 10.0, out=obs)

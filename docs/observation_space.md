@@ -28,9 +28,9 @@ $$
 
 其中 `psi` 是航向角，`u, v` 是拖轮自身体系下的纵向/横向速度，`r` 是偏航角速度。
 
-## 2. Actor 局部观测，71 维
+## 2. Actor 局部观测，86 维
 
-每个拖轮的 actor 输入是一个 71 维向量。环境仍返回扁平向量，actor 内部再切分为自身主观测和邻居 attention 输入。
+每个拖轮的 actor 输入是一个 86 维向量。环境仍返回扁平向量，actor 内部再切分为自身主观测和邻居 attention 输入。
 
 | 索引范围 | 维数 | 名称 |
 |---:|---:|---|
@@ -38,14 +38,14 @@ $$
 | 28-43 | 16 | 执行机构命令历史 |
 | 44-49 | 6 | 大船相对状态 |
 | 50-55 | 6 | 大船轨迹前瞻 |
-| 56-70 | 15 | 邻居 attention 输入 |
+| 56-85 | 30 | 邻居 attention 输入（碰撞风险特征） |
 
 Actor 内部切片为：
 
 $$
 o_i^{\mathrm{own}} = o_i[0:56],
 \qquad
-o_i^{\mathrm{nbr}} = \mathrm{reshape}(o_i[56:71], 3, 5).
+o_i^{\mathrm{nbr}} = \mathrm{reshape}(o_i[56:86], 3, 10).
 $$
 
 ## 3. 自身运动历史，28 维
@@ -246,11 +246,11 @@ o_{i,50:56}
 \right].
 $$
 
-## 7. 邻居 attention 输入，15 维
+## 7. 邻居 attention 输入，30 维
 
-当前默认 4 条拖轮。对拖轮 `i`，其邻居是其余 3 条拖轮，按 tug index 固定顺序排列。
+当前默认 4 条拖轮。对拖轮 `i`，其邻居是其余 3 条拖轮，按 tug index 固定顺序排列。每个邻居从纯几何状态升级为碰撞风险特征，使本船特征（56 维）与邻居特征（3×10=30 维）维度更对等。
 
-邻居 `j` 相对拖轮 `i` 的位置特征为：
+邻居 `j` 相对拖轮 `i` 的位置投影到拖轮 `i` 自身坐标系：
 
 $$
 \begin{bmatrix}
@@ -262,24 +262,18 @@ R(-\psi_i)
 \begin{bmatrix}
 x_j - x_i \\
 y_j - y_i
-\end{bmatrix}.
+\end{bmatrix},
+\qquad
+d_{j,i} = \sqrt{(\Delta x_{j,i}^{\mathrm{ego}})^2 + (\Delta y_{j,i}^{\mathrm{ego}})^2}.
 $$
 
-先把每条拖轮的自身体系速度转到世界系：
+方位角（邻居相对本船船首的夹角）：
 
 $$
-\begin{aligned}
-v_{x,k}^{\mathrm{world}}
-&=
-\cos\psi_k \cdot u_k - \sin\psi_k \cdot v_k,
-\\
-v_{y,k}^{\mathrm{world}}
-&=
-\sin\psi_k \cdot u_k + \cos\psi_k \cdot v_k.
-\end{aligned}
+\theta_{j,i} = \operatorname{atan2}\!\left(\Delta y_{j,i}^{\mathrm{ego}}, \Delta x_{j,i}^{\mathrm{ego}}\right).
 $$
 
-再计算邻居相对速度并投影到拖轮 `i` 自身坐标系：
+相对速度同样投影到拖轮 `i` 自身坐标系（先把各船自身体系速度转到世界系，再做差并投影）：
 
 $$
 \begin{bmatrix}
@@ -294,7 +288,47 @@ v_{y,j}^{\mathrm{world}} - v_{y,i}^{\mathrm{world}}
 \end{bmatrix}.
 $$
 
-每个邻居的 5 维输入为：
+距离变化率（range rate，沿视线方向的相对速度投影，负值表示接近）：
+
+$$
+\dot d_{j,i}
+=
+\frac{
+\Delta x_{j,i}^{\mathrm{ego}}\,\Delta u_{j,i}^{\mathrm{ego}}
++ \Delta y_{j,i}^{\mathrm{ego}}\,\Delta v_{j,i}^{\mathrm{ego}}
+}{d_{j,i}}.
+$$
+
+最近会遇时刻 TCPA 与最近会遇距离 DCPA（基于匀速外推，过去的会遇裁剪为 0）：
+
+$$
+t^{\mathrm{CPA}}_{j,i}
+=
+\max\!\left(
+-\frac{
+\Delta x_{j,i}^{\mathrm{ego}}\,\Delta u_{j,i}^{\mathrm{ego}}
++ \Delta y_{j,i}^{\mathrm{ego}}\,\Delta v_{j,i}^{\mathrm{ego}}
+}{
+(\Delta u_{j,i}^{\mathrm{ego}})^2 + (\Delta v_{j,i}^{\mathrm{ego}})^2
+},\;
+0
+\right),
+$$
+
+$$
+d^{\mathrm{CPA}}_{j,i}
+=
+\left\|
+\begin{bmatrix}
+\Delta x_{j,i}^{\mathrm{ego}} + \Delta u_{j,i}^{\mathrm{ego}}\, t^{\mathrm{CPA}}_{j,i} \\
+\Delta y_{j,i}^{\mathrm{ego}} + \Delta v_{j,i}^{\mathrm{ego}}\, t^{\mathrm{CPA}}_{j,i}
+\end{bmatrix}
+\right\|.
+$$
+
+当相对速度近似为 0（两船相对静止）时退化处理：$t^{\mathrm{CPA}}_{j,i}=60\,\mathrm{s}$，$d^{\mathrm{CPA}}_{j,i}=d_{j,i}$，$\dot d_{j,i}=0$。
+
+每个邻居的 10 维风险特征为：
 
 $$
 b_{j|i}
@@ -302,24 +336,21 @@ b_{j|i}
 \left[
 \frac{\Delta x_{j,i}^{\mathrm{ego}}}{100},
 \frac{\Delta y_{j,i}^{\mathrm{ego}}}{100},
+\min\!\left(\frac{d_{j,i}}{100}, 10\right),
+\sin\theta_{j,i},
+\cos\theta_{j,i},
 \frac{\Delta u_{j,i}^{\mathrm{ego}}}{5},
 \frac{\Delta v_{j,i}^{\mathrm{ego}}}{5},
-\min\left(\frac{d_{j,i}}{100}, 10\right)
-\right],
-$$
-
-其中：
-
-$$
-d_{j,i}
-=
-\sqrt{(x_j-x_i)^2 + (y_j-y_i)^2}.
+\frac{\dot d_{j,i}}{5},
+\min\!\left(\frac{t^{\mathrm{CPA}}_{j,i}}{60}, 10\right),
+\min\!\left(\frac{d^{\mathrm{CPA}}_{j,i}}{100}, 10\right)
+\right].
 $$
 
 3 个邻居拼接为：
 
 $$
-o_{i,56:71}
+o_{i,56:86}
 =
 \left[
 b_{j_1|i},\;
@@ -330,12 +361,12 @@ $$
 
 ## 8. Actor attention 网络如何使用观测
 
-Actor 将 71 维输入切成自身主观测和邻居观测：
+Actor 将 86 维输入切成自身主观测和邻居观测：
 
 $$
 o_i^{\mathrm{own}} \in \mathbb{R}^{56},
 \qquad
-o_i^{\mathrm{nbr}} \in \mathbb{R}^{3\times 5}.
+o_i^{\mathrm{nbr}} \in \mathbb{R}^{3\times 10}.
 $$
 
 自身编码器：
@@ -406,7 +437,7 @@ $$
 
 ## 9. Centralized Critic 全局状态，121 维
 
-MAPPO critic 不使用 actor 的 71 维局部观测，而是使用 `get_global_state()` 构造的 canonical global state。默认 4 条拖轮时维度为：
+MAPPO critic 不使用 actor 的 86 维局部观测，而是使用 `get_global_state()` 构造的 canonical global state。默认 4 条拖轮时维度为：
 
 $$
 5 + 4\times 23 + 4\times 6 = 121.
