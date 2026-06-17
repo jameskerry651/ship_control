@@ -79,12 +79,26 @@ class AttentionCollisionAvoidance(nn.Module):
     """对三艘邻居拖轮做单头缩放点积注意力。"""
 
     def __init__(self, own_feat_dim: int, neigh_feat_dim: int, embed_dim: int = 64) -> None:
+        """
+        初始化单头缩放点积注意力模块。
+
+        Parameters
+        ----------
+        own_feat_dim : int
+            本船特征维度（查询向量输入维度）。
+        neigh_feat_dim : int
+            单个邻居特征维度（键/值向量输入维度）。
+        embed_dim : int, optional
+            注意力嵌入维度，即 Q/K/V 投影后的统一维度，默认 64。
+        """
         super().__init__()
         self.embed_dim = int(embed_dim)
         self.w_q = nn.Linear(own_feat_dim, embed_dim)
         self.w_k = nn.Linear(neigh_feat_dim, embed_dim)
         self.w_v = nn.Linear(neigh_feat_dim, embed_dim)
+        # 输出投影：对聚合后的上下文向量做线性变换
         self.fc_out = nn.Linear(embed_dim, embed_dim)
+        # 缩放因子 sqrt(d_k)，防止点积过大导致 softmax 梯度消失
         self.scale = math.sqrt(float(embed_dim))
 
     def forward(self, e_own: torch.Tensor, e_neighbors: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:

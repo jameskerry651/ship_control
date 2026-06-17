@@ -36,14 +36,8 @@ class MAPPOActorCritic(nn.Module):
         self.n_agents = n_agents
         self.global_state_dim = int(global_state_dim)
 
-        self.actor = MAPPOActor(
-            obs_dim=obs_dim,
-            action_dim=action_dim,
-        )
-        self.critic = MAPPOCritic(
-            global_state_dim=self.global_state_dim,
-            n_agents=n_agents,
-        )
+        self.actor = MAPPOActor(obs_dim=obs_dim,action_dim=action_dim,)
+        self.critic = MAPPOCritic(global_state_dim=self.global_state_dim,n_agents=n_agents,)
 
     @property
     def log_std(self) -> torch.Tensor:
@@ -87,15 +81,7 @@ class MAPPORolloutBuffer:
     truncated episode 的延续。
     """
 
-    def __init__(
-        self,
-        rollout_steps: int,
-        num_envs: int,
-        n_tugs: int,
-        obs_dim: int,
-        action_dim: int,
-        global_state_dim: int,
-        device: torch.device,
+    def __init__(self,rollout_steps: int,num_envs: int,n_tugs: int,obs_dim: int,action_dim: int,global_state_dim: int,device: torch.device,
     ) -> None:
         self.T = rollout_steps
         self.N = num_envs
@@ -126,8 +112,7 @@ class MAPPORolloutBuffer:
     def reset(self) -> None:
         self.ptr = 0
 
-    def add(
-        self,
+    def add(self,
         obs: np.ndarray,              # (N, K, obs_dim)
         global_state: np.ndarray,   # (N, global_state_dim)
         actions: np.ndarray,          # (N, K, action_dim)
