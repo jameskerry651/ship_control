@@ -23,7 +23,7 @@ import signal
 import sys
 import time
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from multiprocessing import Pipe, get_context
 from pathlib import Path
@@ -44,21 +44,30 @@ import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler
 from torch.utils.tensorboard import SummaryWriter
 
+from curricula.loader import CourseSpec, apply_course, load_course
+
 
 # ---------- 奖励运行时归一化（RunningMeanStd） ----------
 class RewardNormalizer:
     """用运行均值和方差对奖励做归一化，稳定 value network 的训练目标。
 
-    采用 Welford 在线算法，不需要存储历史数据。
-    归一化后奖励 ≈ N(0, 1)，value loss 量级稳定，不受奖励函数绝对值影响。
+    对历史样本数做指数衰减（有效窗口 ≈ 1/(1-decay) 个样本），使统计量始终
+    跟随当前策略的奖励分布。纯 Welford（count 单调累加）在训练后期 count 极大，
+    新 batch 几乎无法移动 mean/var，等于把早期分布的归一化系数冻死，稠密信号
+    被越压越平。指数衰减避免这种"遗忘失效"。
     """
 
-    def __init__(self, clip: float = 10.0, epsilon: float = 1e-8) -> None:
+    def __init__(
+        self, clip: float = 10.0, epsilon: float = 1e-8, decay: float = 0.999
+    ) -> None:
         self.mean = 0.0
         self.var = 1.0
-        self.count = 0
+        self.count = 0.0
         self.clip = clip
         self.epsilon = epsilon
+        # 每次 update 前对历史有效样本数乘以 decay。decay=0.999、每 update
+        # 约数千样本时，有效窗口覆盖最近若干十个 update，足以"忘掉"早期策略。
+        self.decay = decay
 
     def update_and_normalize(self, rewards: np.ndarray) -> np.ndarray:
         """更新统计量并返回归一化后的奖励。"""
@@ -68,12 +77,13 @@ class RewardNormalizer:
             return rewards
         batch_mean = float(batch.mean())
         batch_var = float(batch.var()) if n > 1 else 0.0
-        # Welford 合并更新
-        total = self.count + n
+        # 先衰减历史有效样本数，再做 Welford 合并更新（指数加权）。
+        decayed_count = self.count * self.decay
+        total = decayed_count + n
         delta = batch_mean - self.mean
-        self.mean += delta * n / max(total, 1)
-        self.var = (self.var * self.count + batch_var * n +
-                    delta ** 2 * self.count * n / max(total, 1)) / max(total, 1)
+        self.mean += delta * n / max(total, 1e-8)
+        self.var = (self.var * decayed_count + batch_var * n +
+                    delta ** 2 * decayed_count * n / max(total, 1e-8)) / max(total, 1e-8)
         self.count = total
         # 归一化
         std = math.sqrt(max(self.var, self.epsilon))
@@ -367,11 +377,14 @@ def make_vec_env(
     env_workers: int | None,
 ) -> SyncVecEnv | SubprocVecEnv:
     if backend == "subproc":
+        # fork context：worker 不需要 torch（只用纯物理仿真），用 spawn 会导致
+        # 8 个进程同时 import torch 初始化 MPS 死锁（macOS + MPS 特定问题）。
         return SubprocVecEnv(
             env_cfg,
             n_envs=n_envs,
             base_seed=base_seed,
             n_workers=env_workers or n_envs,
+            start_method="fork",
         )
     if env_workers not in (None, 1):
         print("[warn] --env-workers 仅在 --env-backend subproc 时生效，已忽略。")
@@ -472,13 +485,17 @@ def _load_checkpoint(
             load_state[key] = src_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype)
             continue
 
-        # 观测/global-state 追加特征时，只扩展 critic 第一层输入列。
-        # Actor 已切换为 attention 架构；旧 MLP actor 参数按 shape mismatch 跳过。
+        # 观测/global-state 追加特征时，只扩展第一层输入列（新特征追加在末尾）。
+        # 如果输入维度变小，说明有中间列被删除；不能按前缀拷贝，否则特征会错位。
+        # - critic.(critic.)0.weight：global_state 追加特征。
+        # - actor.own_encoder.0.weight：own_obs 末尾追加特征，旧列为新列前缀。
+        # 旧 MLP actor（无 own_encoder）按 shape mismatch 跳过。
         if (
-            key in ("critic.0.weight", "critic.critic.0.weight")
+            key in ("critic.0.weight", "critic.critic.0.weight", "actor.own_encoder.0.weight")
             and src_tensor.ndim == 2
             and dst_tensor.ndim == 2
             and src_tensor.shape[0] == dst_tensor.shape[0]
+            and dst_tensor.shape[1] >= src_tensor.shape[1]
         ):
             value = torch.zeros_like(dst_tensor)
             cols = min(int(src_tensor.shape[1]), int(dst_tensor.shape[1]))
@@ -515,12 +532,22 @@ def _run_eval_episode(
     model_kwargs: dict[str, Any],
     device_str: str,
 ) -> tuple[float, int, bool, bool, float]:
-    """单回合评估（供多进程 eval 调用）。"""
+    """单回合评估（供多进程 eval 调用，每次创建新模型）。"""
     device = torch.device(device_str)
     model = MAPPOActorCritic(**model_kwargs)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
+    return _run_eval_episode_with_model(episode_seed, env_cfg, model)
+
+
+def _run_eval_episode_with_model(
+    episode_seed: int,
+    env_cfg: EnvConfig,
+    model: MAPPOActorCritic,
+) -> tuple[float, int, bool, bool, float]:
+    """用已有模型跑一回合评估（顺序 eval 重复使用模型，避免 MPS 反复分配）。"""
+    _device = next(model.parameters()).device
 
     env = FormationEnv(cfg=env_cfg, seed=episode_seed)
     obs = env.reset()
@@ -530,7 +557,7 @@ def _run_eval_episode(
     info_last: dict = {}
     while not done_any and ep_len < env_cfg.max_episode_steps:
         with torch.no_grad():
-            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=_device)
             action, _, _ = model.act(obs_t, deterministic=True)
         actions_np = action.cpu().numpy()
         obs, rew, done, info = env.step(actions_np)
@@ -580,8 +607,13 @@ def evaluate_policy(
         raise ValueError("model_kwargs is required for evaluate_policy")
 
     if eval_workers <= 1:
+        # 创建一次 eval 模型，重复使用，避免 MPS 反复分配模型（~6s/次）。
+        eval_model = MAPPOActorCritic(**model_kwargs)
+        eval_model.load_state_dict(model.state_dict())
+        eval_model.to(device)
+        eval_model.eval()
         results = [
-            _run_eval_episode(seed + i, env_cfg, model.state_dict(), model_kwargs, str(device))
+            _run_eval_episode_with_model(seed + i, env_cfg, eval_model)
             for i in range(n_episodes)
         ]
     else:
@@ -590,9 +622,22 @@ def evaluate_policy(
             (seed + i, env_cfg, state_cpu, model_kwargs, str(device))
             for i in range(n_episodes)
         ]
+        # macOS 上 spawn 多次创建/销毁子进程会导致死锁，显式用 fork context。
+        ctx = get_context("fork")
         results = []
-        with ProcessPoolExecutor(max_workers=eval_workers) as pool:
-            results = list(pool.map(_run_eval_episode_task, tasks, chunksize=1))
+        try:
+            with ProcessPoolExecutor(max_workers=eval_workers, mp_context=ctx) as pool:
+                results = list(pool.map(_run_eval_episode_task, tasks, chunksize=1))
+        except BrokenExecutor as exc:
+            print(f"[eval-warn] parallel eval failed ({exc}); retrying with 1 worker.")
+            eval_model = MAPPOActorCritic(**model_kwargs)
+            eval_model.load_state_dict(model.state_dict())
+            eval_model.to(device)
+            eval_model.eval()
+            results = [
+                _run_eval_episode_with_model(seed + i, env_cfg, eval_model)
+                for i in range(n_episodes)
+            ]
 
     returns = [r[0] for r in results]
     lengths = [r[1] for r in results]
@@ -613,13 +658,17 @@ def evaluate_policy(
 # ---------- 主训练入口 ----------
 def main() -> None:
     parser = argparse.ArgumentParser(description="多智能体拖轮编队 MAPPO 训练")
-    parser.add_argument("--total-steps", type=int, default=PPOConfig.total_steps,
-                        help="总环境步数（含所有 envs 与所有 tugs）")
+    parser.add_argument("--total-steps", type=int, default=None,
+                        help="总环境步数（含所有 envs 与所有 tugs）；默认使用课程或 PPOConfig")
     parser.add_argument("--num-envs", type=int, default=PPOConfig.num_envs)
     parser.add_argument("--rollout-steps", type=int, default=PPOConfig.rollout_steps)
     parser.add_argument("--minibatch-size", type=int, default=PPOConfig.minibatch_size)
     parser.add_argument("--update-epochs", type=int, default=PPOConfig.update_epochs)
     parser.add_argument("--learning-rate", type=float, default=PPOConfig.learning_rate)
+    parser.add_argument("--entropy-coef", type=float, default=PPOConfig.entropy_coef)
+    parser.add_argument("--target-kl", type=float, default=PPOConfig.target_kl)
+    parser.add_argument("--set-log-std", type=float, default=None,
+                        help="加载/初始化模型后强制设置 actor.log_std，用于低探索微调")
     parser.add_argument("--seed", type=int, default=PPOConfig.seed)
     parser.add_argument("--device", type=str, default=PPOConfig.device,
                         choices=["cpu", "cuda", "mps"])
@@ -633,6 +682,8 @@ def main() -> None:
                         help="从已有 .pt 续训")
     parser.add_argument("--reset-progress", action="store_true",
                         help="仅加载 --resume 的模型权重，重置 optimizer、update 和 global_step")
+    parser.add_argument("--course", type=str, default=None,
+                        help="课程 Python 文件路径；文件需导出 COURSE 字典")
     parser.add_argument("--init-mode", type=str, default=None,
                         choices=["mixed_slot_approach"],
                         help="拖轮初始场景（当前仅支持 mixed_slot_approach；默认使用 config.py）")
@@ -640,6 +691,22 @@ def main() -> None:
                         help="关闭 v36 大船长宽随机化，使用 config.py 中的固定 ship_length_m/ship_beam_m")
     parser.add_argument("--hold-time", type=float, default=None,
                         help="覆盖 EnvConfig.hold_time_s（课程学习用：1.0 → 5.0 → 10.0）")
+    parser.add_argument("--pos-tol", type=float, default=None,
+                        help="覆盖 EnvConfig.pos_tol_m，用于逐步收紧到位距离阈值")
+    parser.add_argument("--heading-tol-deg", type=float, default=None,
+                        help="覆盖 EnvConfig.heading_tol_rad（单位：度）")
+    parser.add_argument("--speed-tol", type=float, default=None,
+                        help="覆盖 EnvConfig.speed_tol_ms")
+    parser.add_argument("--reward-precision-w", type=float, default=None,
+                        help="覆盖 EnvConfig.reward_precision_w，默认关闭")
+    parser.add_argument("--reward-precision-scale", type=float, default=None,
+                        help="覆盖 EnvConfig.reward_precision_scale_m")
+    parser.add_argument("--reward-near-hold-w", type=float, default=None,
+                        help="覆盖 EnvConfig.reward_near_hold_w，默认关闭")
+    parser.add_argument("--reward-near-hold-scale", type=float, default=None,
+                        help="覆盖 EnvConfig.reward_near_hold_scale_m")
+    parser.add_argument("--success-bc-coef", type=float, default=0.0,
+                        help="对成功 episode 样本增加 actor mean 行为克隆损失，默认关闭")
     parser.add_argument("--critic-warmup-updates", type=int, default=0,
                         help=("warm-start 时前 N 个 update 只训 critic（policy_coef=0），"
                               "用于 critic 重置或维度变化后先把 EV 拉起来再放开 actor。"))
@@ -648,34 +715,62 @@ def main() -> None:
                         help="rollout 环境后端：subproc 多进程并行 step，sync 单进程顺序")
     parser.add_argument("--env-workers", type=int, default=None,
                         help="subproc 环境进程数（默认等于 --num-envs）")
-    parser.add_argument("--eval-workers", type=int, default=0,
-                        help="评估并行进程数，0 表示自动取 min(8, CPU-1)")
+    parser.add_argument("--eval-workers", type=int, default=1,
+                        help="评估并行进程数（默认 1=顺序评估；>1 用多进程）")
     parser.add_argument("--torch-threads", type=int, default=0,
                         help="PyTorch CPU 算子线程数，0 表示不修改默认")
     args = parser.parse_args()
 
-    n_cpu = os.cpu_count() or 1
     eval_workers = int(args.eval_workers)
-    if eval_workers <= 0:
-        eval_workers = max(1, min(8, n_cpu - 1))
     if args.torch_threads > 0:
         torch.set_num_threads(int(args.torch_threads))
 
     # 配置对象
     env_cfg = EnvConfig()
+    course_spec: CourseSpec | None = None
+    course_metadata: dict[str, Any] | None = None
+    if args.course is not None:
+        try:
+            course_spec = load_course(_project_path(args.course))
+        except Exception as exc:
+            raise SystemExit(f"[course] failed to load {args.course!r}: {exc}") from exc
+        apply_course(env_cfg, course_spec)
+        course_metadata = course_spec.metadata()
     if args.init_mode is not None:
         env_cfg.tug_init_mode = args.init_mode
     if args.no_ship_size_randomize:
         env_cfg.ship_size_randomize = False
     if args.hold_time is not None:
         env_cfg.hold_time_s = float(args.hold_time)
+    if args.pos_tol is not None:
+        env_cfg.pos_tol_m = float(args.pos_tol)
+    if args.heading_tol_deg is not None:
+        env_cfg.heading_tol_rad = math.radians(float(args.heading_tol_deg))
+    if args.speed_tol is not None:
+        env_cfg.speed_tol_ms = float(args.speed_tol)
+    if args.reward_precision_w is not None:
+        env_cfg.reward_precision_w = float(args.reward_precision_w)
+    if args.reward_precision_scale is not None:
+        env_cfg.reward_precision_scale_m = float(args.reward_precision_scale)
+    if args.reward_near_hold_w is not None:
+        env_cfg.reward_near_hold_w = float(args.reward_near_hold_w)
+    if args.reward_near_hold_scale is not None:
+        env_cfg.reward_near_hold_scale_m = float(args.reward_near_hold_scale)
+    if args.total_steps is not None:
+        total_steps = int(args.total_steps)
+    elif course_spec is not None and course_spec.total_steps is not None:
+        total_steps = int(course_spec.total_steps)
+    else:
+        total_steps = PPOConfig.total_steps
     ppo_cfg = PPOConfig(
-        total_steps=args.total_steps,
+        total_steps=total_steps,
         num_envs=args.num_envs,
         rollout_steps=args.rollout_steps,
         minibatch_size=args.minibatch_size,
         update_epochs=args.update_epochs,
         learning_rate=args.learning_rate,
+        entropy_coef=args.entropy_coef,
+        target_kl=args.target_kl,
         seed=args.seed,
         device=args.device,
     )
@@ -698,6 +793,13 @@ def main() -> None:
     print(f"[init] log_dir  = {log_dir}")
     print(f"[init] ckpt_dir = {ckpt_dir}")
     print(f"[init] device   = {device}")
+    if course_spec is not None:
+        print(f"[course] name = {course_spec.name}")
+        print(f"[course] path = {course_spec.path}")
+        if course_spec.description:
+            print(f"[course] description = {course_spec.description}")
+        print(f"[course] total_steps = {course_spec.total_steps}")
+        print(f"[course] env_overrides = {dict(course_spec.env_overrides)}")
     print(f"[init] init_mode = {env_cfg.tug_init_mode}, "
           f"obs_history_k={env_cfg.obs_history_k}, "
           f"ship_preview_times={env_cfg.obs_ship_preview_times_s}, "
@@ -710,6 +812,9 @@ def main() -> None:
     hparams_text = "\n".join([f"env.{k} = {v}" for k, v in asdict(env_cfg).items()] +
                              [f"ppo.{k} = {v}" for k, v in asdict(ppo_cfg).items()])
     writer.add_text("hparams", hparams_text.replace("\n", "  \n"), 0)
+    if course_metadata is not None:
+        course_text = "\n".join(f"{k} = {v}" for k, v in course_metadata.items())
+        writer.add_text("course", course_text.replace("\n", "  \n"), 0)
 
     # 向量化环境
     vec_env = make_vec_env(
@@ -756,6 +861,10 @@ def main() -> None:
         )
         print(f"[resume] loaded {resume_path}: "
               f"update={start_update}, global_step={global_step}")
+    if args.set_log_std is not None:
+        with torch.no_grad():
+            model.actor.log_std.fill_(float(args.set_log_std))
+        print(f"[init] actor.log_std set to {float(args.set_log_std):.3f}")
 
     # Rollout buffer
     buffer = MAPPORolloutBuffer(
@@ -836,6 +945,7 @@ def main() -> None:
             (ppo_cfg.rollout_steps, ppo_cfg.num_envs, env_cfg.n_tugs), dtype=bool
         )
         noncollision_episode_mask = np.zeros_like(collision_episode_mask)
+        success_episode_mask = np.zeros_like(collision_episode_mask)
         for t in range(ppo_cfg.rollout_steps):
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)  # (N, K, obs_dim)
@@ -899,7 +1009,10 @@ def main() -> None:
                     continue
                 start_t = int(episode_start_t[env_idx])
                 if start_t <= t:
-                    if bool(info[env_idx].get("collision", False)):
+                    if bool(info[env_idx].get("success", False)):
+                        success_episode_mask[start_t:t + 1, env_idx, :] = True
+                        noncollision_episode_mask[start_t:t + 1, env_idx, :] = True
+                    elif bool(info[env_idx].get("collision", False)):
                         collision_episode_mask[start_t:t + 1, env_idx, :] = True
                     else:
                         noncollision_episode_mask[start_t:t + 1, env_idx, :] = True
@@ -948,6 +1061,9 @@ def main() -> None:
         noncollision_mask_t = torch.as_tensor(
             noncollision_episode_mask, dtype=torch.bool, device=device
         )
+        success_mask_t = torch.as_tensor(
+            success_episode_mask, dtype=torch.bool, device=device
+        )
 
         # ---------- 3. MAPPO 更新 ----------
         # warm-start 时前 N 个 update 只训 critic：policy_coef=0 把 actor / entropy
@@ -971,6 +1087,8 @@ def main() -> None:
             policy_coef=policy_coef,
             collision_mask=collision_mask_t,
             noncollision_mask=noncollision_mask_t,
+            success_bc_coef=float(args.success_bc_coef),
+            success_bc_mask=success_mask_t,
         )
         update_dt = time.time() - update_t0
 
@@ -994,6 +1112,7 @@ def main() -> None:
         writer.add_scalar("loss/entropy", stats.entropy, global_step)          # 策略熵（探索强度，越大越随机）
         writer.add_scalar("loss/approx_kl", stats.approx_kl, global_step)        # 新旧策略近似 KL，过大时 target_kl 早停
         writer.add_scalar("loss/clip_frac", stats.clip_frac, global_step)      # ratio 被 PPO clip 的样本比例
+        writer.add_scalar("loss/success_bc", stats.success_bc_loss, global_step)
         writer.add_scalar("loss/explained_variance", stats.explained_variance, global_step)  # critic 对 return 的解释度，→1 越好
         _add_finite_scalar(writer, "loss/value_collision", stats.value_loss_collision, global_step)
         _add_finite_scalar(writer, "loss/value_noncollision", stats.value_loss_noncollision, global_step)
@@ -1010,6 +1129,7 @@ def main() -> None:
         _add_finite_scalar(writer, "return_target/var", return_target_var, global_step)
         writer.add_scalar("value_diag/collision_sample_count", int(collision_episode_mask.sum()), global_step)
         writer.add_scalar("value_diag/noncollision_sample_count", int(noncollision_episode_mask.sum()), global_step)
+        writer.add_scalar("value_diag/success_bc_sample_count", stats.success_bc_sample_count, global_step)
         # 优化器与探索尺度（opt/*）
         writer.add_scalar("opt/learning_rate", stats.learning_rate, global_step)  # 当前 Adam 学习率
         writer.add_scalar("opt/log_std_mean", stats.log_std_mean, global_step)     # 动作 log_std 均值（探索噪声尺度）
@@ -1106,6 +1226,7 @@ def main() -> None:
                     update=update + 1, global_step=global_step,
                     metric=cur_succ,
                     lr_scheduler=lr_scheduler,
+                    course_metadata=course_metadata,
                 )
                 print(f"  [save] best.pt updated (succ={cur_succ*100:.1f}%, "
                       f"coll={cur_coll*100:.1f}%, d={cur_dist:.1f}m, "
@@ -1128,6 +1249,7 @@ def main() -> None:
                 update=update + 1, global_step=global_step,
                 metric=recent_ret,
                 lr_scheduler=lr_scheduler,
+                course_metadata=course_metadata,
             )
 
         if lr_scheduler is not None:
@@ -1145,6 +1267,7 @@ def main() -> None:
         update=last_completed_update, global_step=global_step,
         metric=float(np.mean(ep_return_window)) if ep_return_window else 0.0,
         lr_scheduler=lr_scheduler,
+        course_metadata=course_metadata,
     )
     vec_env.close()
     writer.close()
@@ -1167,6 +1290,7 @@ def _save_ckpt(
     global_step: int,
     metric: float,
     lr_scheduler: LRScheduler | None = None,
+    course_metadata: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "algo": "mappo",
@@ -1184,6 +1308,8 @@ def _save_ckpt(
         "global_step": global_step,
         "metric": metric,
     }
+    if course_metadata is not None:
+        payload["course"] = course_metadata
     if lr_scheduler is not None:
         payload["lr_scheduler"] = lr_scheduler.state_dict()
         payload["lr_scheduler_type"] = type(lr_scheduler).__name__

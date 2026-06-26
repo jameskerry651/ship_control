@@ -72,6 +72,14 @@ class EnvConfig:
     tug_init_ready_forward_action: float = 0.22                  # 已就位拖轮初始前进油门；其 jitter 为 tug_init_action_jitter 的一半
     tug_init_mixed_route_longitudinal_jitter_m: float = 18.0   # 未就位拖轮在 rear/gate/opposite 等区域的纵向采样扰动（米）
     tug_init_mixed_route_lateral_jitter_m: float = 20.0        # 未就位拖轮在上述区域的横向采样扰动（米）
+    tug_init_mixed_zones: tuple[str, ...] = (
+        "rear_lane",
+        "stern_gate",
+        "side_lane",
+        "outer_slot",
+        "opposite_stern",
+    )
+    tug_init_force_single_opposite: bool = True
     tug_init_mixed_approach_speed_min_ms: float = 0.20         # 未就位拖轮朝 route 目标点缓慢接近时的速度下限（m/s）
     tug_init_mixed_approach_speed_max_ms: float = 0.80         # 同上上限；过大易开局远距离高速追赶
     tug_init_mixed_opposite_stern_dist_min_m: float = 220.0    # opposite_stern 区：距船尾端面纵向距离下限（米）
@@ -105,7 +113,7 @@ class EnvConfig:
     pos_tol_m: float = 140.0              # 
     heading_tol_rad: float = math.radians(30.0)
     speed_tol_ms: float = 3.0             # 
-    hold_time_s: float = 1.0              # curriculum: 5s -> 10s -> 20s -> 30s 逐步提升稳定伴航时间
+    hold_time_s: float = 2.0              # curriculum: 1s→2s→5s 逐步提升
 
     # 安全距离
     tug_collision_dist_m: float = 20.0
@@ -113,36 +121,73 @@ class EnvConfig:
 
     # ---------- 奖励权重 ----------
     # Dense reward:
-    # R = w1 * R_target + w2 * R_velocity + w3 * R_control - w4 * P_collision.
+    # R = w1 * R_target + w2 * R_velocity - w3 * P_collision.
     reward_target_w: float = 1.0
     reward_velocity_w: float = 0.25
-    reward_control_w: float = 0.2
-    reward_collision_w: float = 6.0
+    reward_collision_w: float = 3.0
+    # P5 每步 P_collision 上限：防单次近距 barrier（可叠加 ship+3 邻居+CPA）压垮接近梯度，
+    # 缓解过度保守；硬碰撞威慑改由 P1 的按责终端 −80 承担。
+    reward_collision_cap: float = 1.5
+    # P2 团队同步项：以"最弱一艇"的在区度（softmin）为优化对象，给全员同一份稠密奖励，
+    # 弥补"4 艘同时在区"只由稀疏终端 +80 驱动、稠密层缺同步梯度的问题。
+    reward_team_w: float = 0.5
+    # softmin 锐度：越大越接近 min（更聚焦最弱一艇），越小越接近均值。
+    reward_team_softmin_beta: float = 4.0
+    # P3 势函数式接近 shaping：F = γ·Φ(s') − Φ(s)，Φ = −(0.6·d/d_ref + 0.25·spd/spd_tol + 0.15·head/head_tol)。
+    # 理论上策略不变、对 reward 归一化鲁棒、提供一路到底的稠密接近梯度，缓解过度保守（dist 卡在 145–242m）。
+    reward_shape_w: float = 0.3
+    reward_shape_gamma: float = 0.99
+    reward_shape_d_ref_m: float = 200.0
+    reward_shape_clip: float = 1.0
+    # Strict-position curriculum uses this optional dense term to keep a
+    # learnable gradient inside the near-slot region while the terminal
+    # success threshold is tightened to 20 m. Default 0 preserves old runs.
+    reward_precision_w: float = 0.0
+    reward_precision_scale_m: float = 40.0
+    # Optional near-slot shaping for strict curricula. Unlike r_hold, this does
+    # not go to zero immediately outside pos_tol_m, so it can teach the policy
+    # to move deterministic mean actions from 60 m toward a 20 m terminal gate.
+    reward_near_hold_w: float = 0.0
+    reward_near_hold_scale_m: float = 80.0
 
     # R_target：远场 chase + 近场 hold。
     reward_target_progress_clip_m: float = 1.5
     reward_chase_speed_target_ms: float = 0.8
     reward_hold_start_m: float = 140.0
     reward_hold_full_m: float = 20.0
+    # 额外 route 辅助项：保留直接 slot progress 作为主目标，只在非 final
+    # route 阶段小权重奖励沿规划路径减少 remaining distance。
+    reward_route_w: float = 0.25
+    # P4 hold 连续性鲁棒化：
+    # - streak_decay：单帧违例时 in_zone_steps 减此值而非清零，容忍 ship 机动引起的瞬时闪断，
+    #   让 2s 连续 hold 在多艇同步下可达；decay>1 仍能防"闪进闪出"刷成功。
+    # - streak_w：按 in_zone_steps/hold_steps 的连续值给稠密奖励，直接激励"逼近并维持 2s hold"。
+    reward_hold_streak_decay: int = 2
+    reward_hold_streak_w: float = 0.3
 
     # R_velocity：近场强匹配大船线速度和角速度，远场只给弱约束。
     reward_velocity_gate_m: float = 120.0
     reward_velocity_speed_scale_ms: float = 3.0
     reward_velocity_yaw_scale_rads: float = 0.05
 
-    # R_control：动作变化、一阶变化的变化和动作幅值。
-    reward_control_delta_w: float = 1.0
-    reward_control_jerk_w: float = 0.5
-    reward_control_mag_w: float = 0.05
-
-    # P_collision：连续安全 barrier；硬碰撞仍由终端惩罚处理。
-    reward_collision_ship_safe_m: float = 30.0
-    reward_collision_tug_safe_m: float = 60.0
+    # P_collision：当前距离 barrier + CPA 预判 barrier；硬碰撞仍由终端惩罚处理。
+    reward_collision_ship_safe_m: float = 60.0
+    reward_collision_tug_safe_m: float = 80.0
     ship_safety_dist_m: float = 18.0      # 初始化采样的最小船体安全距离。
+    reward_cpa_horizon_s: float = 60.0    # CPA 风险预判窗口；窗口内越早会遇惩罚越强。
+    reward_collision_cpa_w: float = 2.0   # CPA 风险在 P_collision 内的额外权重。
 
     # 终端信号：不参与 dense reward 归一化。
-    reward_arrival_bonus: float = 120.0
-    reward_collision_pen: float = 20.0
+    # 碰撞惩罚与到达奖励同量级，避免策略学会"赌博式逼近"：
+    # 当 pen << bonus 时，只要 P(到达) > P(碰撞)·pen/bonus 激进贴近就 EV 为正，
+    # 碰撞率会随 chase 能力增强而单调上升。pen≈bonus 时撞船不再是可接受代价。
+    reward_arrival_bonus: float = 80.0
+    reward_collision_pen: float = 80.0
+    # P1 终端碰撞惩罚按责分配：肇事 tug 重罚、其余 bystander 轻罚。
+    # 现状"全员共担 −80"使 critic 无法归因（实测 EV_collision 为负、value_collision 爆炸），
+    # advantage 噪声大、策略不稳。按责分配后无辜 tug 不再吃满惩罚，value 可学、梯度更干净。
+    reward_collision_pen_culprit: float = 80.0
+    reward_collision_pen_bystander: float = 15.0
 
     # Actor 观察：4 帧历史（当前 + 过去 3 帧）与 3 个大船中心未来前瞻点。
     obs_history_k: int = 3
@@ -154,22 +199,22 @@ class EnvConfig:
 class PPOConfig:
     # PPO 超参数
     gamma: float = 0.99
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.98
     clip_eps: float = 0.2
     value_clip_eps: float = 0.2
-    entropy_coef: float = 0.01            # entropy 系数：0.005 太低易早收敛，0.02 太高阻止收敛
+    entropy_coef: float = 0.005           # entropy 系数，从 0.01 降低以加速策略收敛
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
-    target_kl: float = 0.03               # 早停的 KL 阈值
+    target_kl: float = 0.015              # 更保守的 KL 早停阈值，抑制后期策略漂移
 
     # 数据收集
-    rollout_steps: int = 256              # 每个并行环境每次 rollout 收集的步数
+    rollout_steps: int = 512              # 每个并行环境每次 rollout 收集的步数，从 256 翻倍以覆盖更多完整 episode
     num_envs: int = 8                     # 并行环境数（顺序执行的 vector env）
     minibatch_size: int = 1024            # 一次梯度更新的 mini-batch 大小
-    update_epochs: int = 3                # 每轮 rollout 后对同一批数据重复 PPO 更新的 epoch 数
+    update_epochs: int = 4                # 降低重复更新次数，减少后期策略漂移
 
     # 优化器（torch.optim.lr_scheduler.CosineAnnealingLR）
-    learning_rate: float = 5e-5
+    learning_rate: float = 1e-4
     lr_anneal: bool = True                # 是否启用余弦学习率退火
     lr_min_factor: float = 0.05           # eta_min = learning_rate * lr_min_factor
 

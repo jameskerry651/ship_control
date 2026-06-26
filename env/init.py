@@ -316,11 +316,14 @@ class InitSampler:
         side = self._slot_side_sign(slot_idx)
         min_pair_dist, min_hull_dist = self._mixed_init_safety_margins()
         lane_min = float(getattr(cfg, "route_lane_min_lat_m", 32.0))
-        zones = (
-            ["opposite_stern"]
-            if force_opposite_side
-            else ["rear_lane", "stern_gate", "side_lane", "outer_slot", "opposite_stern"]
-        )
+        all_zones = ["rear_lane", "stern_gate", "side_lane", "outer_slot", "opposite_stern"]
+        if force_opposite_side:
+            zones = ["opposite_stern"]
+        else:
+            configured = tuple(getattr(cfg, "tug_init_mixed_zones", tuple(all_zones)))
+            zones = [str(zone) for zone in configured if str(zone) in all_zones]
+            if not zones:
+                zones = list(all_zones)
         zones = list(env.rng.permutation(np.asarray(zones, dtype=object)))
 
         chosen_xy: tuple[float, float] | None = None
@@ -411,7 +414,11 @@ class InitSampler:
             placed.append((float(pos[0]), float(pos[1])))
 
         free_slots = [i for i in range(n) if i not in ready_slots]
-        force_single_opposite = ready_count == n - 1 and len(free_slots) == 1
+        force_single_opposite = (
+            ready_count == n - 1
+            and len(free_slots) == 1
+            and bool(getattr(cfg, "tug_init_force_single_opposite", True))
+        )
         for i in env.rng.permutation(free_slots):
             pos, psi, nu, action = self._sample_random_route_state(
                 int(i),

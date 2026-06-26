@@ -26,6 +26,51 @@ from env.formation_env import FormationEnv
 from utils.mpl_fonts import configure_matplotlib_fonts
 from rl.ppo import MAPPOActorCritic
 
+
+def _load_visualization_state(
+    model: MAPPOActorCritic,
+    state: dict[str, torch.Tensor],
+) -> tuple[list[str], list[str]]:
+    """Load checkpoint weights for visualization across observation-size changes."""
+    dst_state = model.state_dict()
+    load_state: dict[str, torch.Tensor] = {}
+    migrated: list[str] = []
+    skipped: list[str] = []
+    actor_arch_changed = "actor.own_encoder.0.weight" not in state
+
+    for key, dst_tensor in dst_state.items():
+        if actor_arch_changed and key.startswith("actor.") and key != "actor.log_std":
+            skipped.append(f"{key}: initialized for current attention actor")
+            continue
+
+        src_tensor = state.get(key)
+        if src_tensor is None:
+            skipped.append(f"{key}: missing in checkpoint")
+            continue
+
+        if tuple(src_tensor.shape) == tuple(dst_tensor.shape):
+            load_state[key] = src_tensor.to(dtype=dst_tensor.dtype)
+            continue
+
+        if (
+            key in ("actor.own_encoder.0.weight", "critic.0.weight", "critic.critic.0.weight")
+            and src_tensor.ndim == 2
+            and dst_tensor.ndim == 2
+            and src_tensor.shape[0] == dst_tensor.shape[0]
+        ):
+            value = torch.zeros_like(dst_tensor)
+            cols = min(int(src_tensor.shape[1]), int(dst_tensor.shape[1]))
+            value[:, :cols] = src_tensor[:, :cols].to(dtype=dst_tensor.dtype)
+            load_state[key] = value
+            migrated.append(f"{key}: {tuple(src_tensor.shape)} -> {tuple(dst_tensor.shape)}")
+            continue
+
+        skipped.append(f"{key}: {tuple(src_tensor.shape)} -> {tuple(dst_tensor.shape)}")
+
+    model.load_state_dict(load_state, strict=False)
+    return migrated, skipped
+
+
 C_SEA_TOP    = (8,   14,  30)
 C_SEA_BOT    = (18,  28,  48)
 C_GRID       = (25,  45,  65)
@@ -632,22 +677,29 @@ def run_visualization(
                 raise RuntimeError("checkpoint does not contain recognizable MAPPO actor weights")
         dummy_env = FormationEnv(cfg=env_cfg)
         if actual_obs_dim != dummy_env.obs_dim:
-            raise RuntimeError(
+            print(
                 f"checkpoint obs_dim={actual_obs_dim}, env obs_dim={dummy_env.obs_dim}; "
-                "cannot match observation dimensions"
+                "loading compatible weights for current visualization env"
             )
 
         critic_in_dim: int | None = None
         critic_prefix = "critic.critic" if "critic.critic.0.weight" in state else "critic"
         if f"{critic_prefix}.0.weight" in state:
-            critic_in_dim = int(state[f"{critic_prefix}.0.weight"].shape[1])
+            # critic 第一层输入 = global_state_dim + agent one-hot(n_agents)，
+            # 还原真实 global_state_dim 再传入（MAPPOCritic 内部会再加回 one-hot）
+            trunk_in = int(state[f"{critic_prefix}.0.weight"].shape[1])
+            critic_in_dim = trunk_in - env_cfg.n_tugs
         policy = MAPPOActorCritic(
-            obs_dim=actual_obs_dim,
+            obs_dim=dummy_env.obs_dim,
             action_dim=dummy_env.action_dim,
             n_agents=env_cfg.n_tugs,
-            global_state_dim=critic_in_dim,
+            global_state_dim=critic_in_dim or dummy_env.global_state_dim,
         )
-        policy.load_state_dict(state)
+        migrated, skipped = _load_visualization_state(policy, state)
+        if migrated:
+            print("[viz] migrated checkpoint weights: " + "; ".join(migrated))
+        if skipped:
+            print("[viz] skipped checkpoint tensors: " + "; ".join(skipped))
         print(f"[viz] loaded MAPPO checkpoint: {checkpoint_path}")
     policy_eval = policy
     if policy is not None:

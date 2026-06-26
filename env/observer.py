@@ -1,6 +1,6 @@
 """拖轮编队环境的观测与全局状态构建。
 
-构建每个智能体的86维观测向量，以及用于中心化评论器的121维标准全局状态。
+构建每个智能体的93维观测向量，以及用于中心化评论器的90维标准全局状态。
 """
 
 from __future__ import annotations
@@ -18,10 +18,19 @@ if TYPE_CHECKING:
 # --------  observation dimension constants  --------
 ACTION_DIM: int = 4
 
-_EGO_MOTION_OBS_DIM = 7
+_EGO_MOTION_OBS_DIM = 6
 _ACTION_HISTORY_OBS_DIM = ACTION_DIM
-_SHIP_REL_OBS_DIM = 6
+_SHIP_REL_OBS_DIM = 5
 _SHIP_PREVIEW_POINT_DIM = 2
+# 本 agent 目标槽位（在自身坐标系下）的相对量：[dx/100, dy/100, dist, sin(dψ), cos(dψ)]
+# 关键：actor 4 个 agent 参数共享，但每个 tug 的目标槽位不同。若 own_obs 不含目标槽位，
+# 共享策略在相近位姿下会输出相近动作、把多船挤向同一区域，碰撞率随训练上升。
+# 槽位 one-hot 之前只喂给 critic（get_global_state），actor 看不到，故必须在此补上。
+_SLOT_TARGET_OBS_DIM = 5
+# 当前路径目标和进度：[route_dx/100, route_dy/100, stage_norm, remaining/500]
+_ROUTE_TARGET_OBS_DIM = 4
+# 最近船体边界向量与距离：[closest_hull_dx/50, closest_hull_dy/50, d_hull/50]
+_HULL_CLEARANCE_OBS_DIM = 3
 _NEIGHBOR_COUNT = 3
 # 单个邻居观测维度：从纯几何状态升级为碰撞风险特征
 # [dx, dy, distance, sin(bearing), cos(bearing), du, dv, range_rate, tcpa, dcpa]
@@ -33,14 +42,13 @@ _NEIGHBOR_TCPA_SCALE_S = 60.0
 _NEIGHBOR_REL_SPEED_EPS = 1e-6
 
 # --------  global-state dimension constants  --------
-_GLOBAL_SHIP_DIM = 5
-_GLOBAL_PER_TUG_DIM = 23
-_GLOBAL_ACCEL_PER_TUG_DIM = 6
+_GLOBAL_SHIP_DIM = 2
+_GLOBAL_PER_TUG_DIM = 19
+_GLOBAL_ACCEL_PER_TUG_DIM = 3
 
 _TUG_LINEAR_ACCEL_SCALE = 1.0
 _TUG_YAW_ACCEL_SCALE = 0.1
 _SHIP_LINEAR_ACCEL_SCALE = 0.2
-_SHIP_YAW_ACCEL_SCALE = 0.01
 
 
 def world_to_local(dx: float, dy: float, psi_local: float) -> tuple[float, float]:
@@ -57,6 +65,24 @@ def local_to_world(dx_local: float, dy_local: float, psi_local: float) -> tuple[
     x_world = c * dx_local - s * dy_local
     y_world = s * dx_local + c * dy_local
     return x_world, y_world
+
+
+def _closest_hull_point_body(x_body: float, y_body: float, length_m: float, beam_m: float) -> tuple[float, float]:
+    """Closest point on the rectangular collision hull in ship body coordinates."""
+    l_half = length_m / 2.0
+    b_half = beam_m / 2.0
+    clamped_x = float(np.clip(x_body, -l_half, l_half))
+    clamped_y = float(np.clip(y_body, -b_half, b_half))
+
+    if abs(x_body) <= l_half and abs(y_body) <= b_half:
+        dx_edge = l_half - abs(x_body)
+        dy_edge = b_half - abs(y_body)
+        if dx_edge < dy_edge:
+            clamped_x = math.copysign(l_half, x_body if x_body != 0.0 else 1.0)
+        else:
+            clamped_y = math.copysign(b_half, y_body if y_body != 0.0 else 1.0)
+
+    return clamped_x, clamped_y
 
 
 class Observer:
@@ -77,8 +103,7 @@ class Observer:
             [
                 float(tug.nu.x) / 5.0,
                 float(tug.nu.y) / 5.0,
-                math.sin(float(tug.eta.z)),
-                math.cos(float(tug.eta.z)),
+                float(tug.nu.z) / 0.5,
                 du / 5.0,
                 dv / 5.0,
                 dr / 0.5,
@@ -113,6 +138,7 @@ class Observer:
         obs = np.zeros((env.n_tugs, env.obs_dim), dtype=np.float32)
         ship_u, ship_v, ship_r = env.ship.u, env.ship.v, env.ship.r
         preview_times = tuple(getattr(env.cfg, "obs_ship_preview_times_s", (5.0, 10.0, 15.0)))
+        slot_world = env.ship.slot_positions_world()
 
         tug_world_vx = np.zeros(env.n_tugs, dtype=np.float32)
         tug_world_vy = np.zeros(env.n_tugs, dtype=np.float32)
@@ -139,9 +165,8 @@ class Observer:
             obs[i, idx + 0] = ship_dx_local / 100.0
             obs[i, idx + 1] = ship_dy_local / 100.0
             obs[i, idx + 2] = ship_u / 3.0
-            obs[i, idx + 3] = ship_v / 3.0
-            obs[i, idx + 4] = math.sin(dpsi_ship)
-            obs[i, idx + 5] = math.cos(dpsi_ship)
+            obs[i, idx + 3] = math.sin(dpsi_ship)
+            obs[i, idx + 4] = math.cos(dpsi_ship)
             idx += _SHIP_REL_OBS_DIM
 
             cs = math.cos(env.ship.psi)
@@ -167,6 +192,51 @@ class Observer:
                 obs[i, idx + 0] = dx_local / 100.0
                 obs[i, idx + 1] = dy_local / 100.0
                 idx += _SHIP_PREVIEW_POINT_DIM
+
+            # 本 agent 目标槽位（自身坐标系下的相对量）。让共享策略能区分"我该去哪个槽位"，
+            # 否则多船会挤向同一区域。slot_world 由大船当前位姿给出，与 reward 用的目标一致。
+            slot = slot_world[env.tug_to_slot[i]]
+            slot_dx_w = float(slot[0]) - tug.eta.x
+            slot_dy_w = float(slot[1]) - tug.eta.y
+            slot_dx_local, slot_dy_local = world_to_local(slot_dx_w, slot_dy_w, tug.eta.z)
+            slot_dist = math.hypot(slot_dx_local, slot_dy_local)
+            dpsi_slot = _wrap_pi(float(slot[2]) - tug.eta.z)
+            obs[i, idx + 0] = slot_dx_local / 100.0
+            obs[i, idx + 1] = slot_dy_local / 100.0
+            obs[i, idx + 2] = min(slot_dist / 100.0, 10.0)
+            obs[i, idx + 3] = math.sin(dpsi_slot)
+            obs[i, idx + 4] = math.cos(dpsi_slot)
+            idx += _SLOT_TARGET_OBS_DIM
+
+            route_target = env._route._current_route_target_world(i)
+            route_dx_w = float(route_target[0]) - tug.eta.x
+            route_dy_w = float(route_target[1]) - tug.eta.y
+            route_dx_local, route_dy_local = world_to_local(route_dx_w, route_dy_w, tug.eta.z)
+            route_len = len(env._route._route_waypoints_body_for_tug(i))
+            stage_norm = float(env.route_stage[i]) / max(route_len - 1, 1)
+            obs[i, idx + 0] = route_dx_local / 100.0
+            obs[i, idx + 1] = route_dy_local / 100.0
+            obs[i, idx + 2] = float(np.clip(stage_norm, 0.0, 1.0))
+            obs[i, idx + 3] = float(env._route._route_remaining_distance(i)) / 500.0
+            idx += _ROUTE_TARGET_OBS_DIM
+
+            tug_x_body, tug_y_body = env._ship_body_xy(tug.eta.x, tug.eta.y)
+            hull_x_body, hull_y_body = _closest_hull_point_body(
+                float(tug_x_body),
+                float(tug_y_body),
+                float(env.ship.length_m),
+                float(env.ship.beam_m),
+            )
+            hull_x_world, hull_y_world = env._ship_body_to_world_xy(hull_x_body, hull_y_body)
+            hull_dx_local, hull_dy_local = world_to_local(
+                hull_x_world - tug.eta.x,
+                hull_y_world - tug.eta.y,
+                tug.eta.z,
+            )
+            obs[i, idx + 0] = hull_dx_local / 50.0
+            obs[i, idx + 1] = hull_dy_local / 50.0
+            obs[i, idx + 2] = float(env.ship.distance_from_hull(tug.eta.x, tug.eta.y)) / 50.0
+            idx += _HULL_CLEARANCE_OBS_DIM
 
             other_idx = [j for j in range(env.n_tugs) if j != i]
             for j in other_idx:
@@ -224,12 +294,7 @@ class Observer:
         state = np.zeros(env.global_state_dim, dtype=np.float32)
 
         state[0] = float(env.ship.u) / 5.0
-        state[1] = float(env.ship.v) / 5.0
-        state[2] = float(env.ship.r) / 0.05
-        base_length = max(float(getattr(cfg, "ship_length_m", 200.0)), 1e-6)
-        base_beam = max(float(getattr(cfg, "ship_beam_m", 30.0)), 1e-6)
-        state[3] = float(env.ship.length_m) / base_length - 1.0
-        state[4] = float(env.ship.beam_m) / base_beam - 1.0
+        state[1] = float(env.ship.u_dot) / _SHIP_LINEAR_ACCEL_SCALE
 
         cs_s = math.cos(env.ship.psi)
         sn_s = math.sin(env.ship.psi)
@@ -266,18 +331,15 @@ class Observer:
 
             state[base + 11:base + 15] = env.last_actions[i]
 
-            slot_idx = int(env.tug_to_slot[i])
-            state[base + 15 + slot_idx] = 1.0
-
             route_len = len(env._route._route_waypoints_body_for_tug(i))
             stage_norm = float(env.route_stage[i]) / max(route_len - 1, 1)
-            state[base + 19] = float(np.clip(stage_norm, 0.0, 1.0))
-            state[base + 20] = float(env._route._route_remaining_distance(i)) / 500.0
+            state[base + 15] = float(np.clip(stage_norm, 0.0, 1.0))
+            state[base + 16] = float(env._route._route_remaining_distance(i)) / 500.0
 
-            state[base + 21] = float(env.in_zone_steps[i]) / float(hold_steps)
+            state[base + 17] = float(env.in_zone_steps[i]) / float(hold_steps)
 
             d_hull = env.ship.distance_from_hull(tug.eta.x, tug.eta.y)
-            state[base + 22] = float(d_hull) / 50.0
+            state[base + 18] = float(d_hull) / 50.0
 
             acc = tug.get_last_nu_dot()
             ax_w = ci * acc.x - si * acc.y
@@ -288,9 +350,6 @@ class Observer:
             state[acc_base + 0] = float(ax_b) / _TUG_LINEAR_ACCEL_SCALE
             state[acc_base + 1] = float(ay_b) / _TUG_LINEAR_ACCEL_SCALE
             state[acc_base + 2] = float(acc.z) / _TUG_YAW_ACCEL_SCALE
-            state[acc_base + 3] = float(env.ship.u_dot) / _SHIP_LINEAR_ACCEL_SCALE
-            state[acc_base + 4] = float(env.ship.v_dot) / _SHIP_LINEAR_ACCEL_SCALE
-            state[acc_base + 5] = float(env.ship.r_dot) / _SHIP_YAW_ACCEL_SCALE
 
         np.clip(state, -10.0, 10.0, out=state)
         return state

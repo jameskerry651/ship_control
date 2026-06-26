@@ -28,27 +28,30 @@ $$
 
 其中 `psi` 是航向角，`u, v` 是拖轮自身体系下的纵向/横向速度，`r` 是偏航角速度。
 
-## 2. Actor 局部观测，86 维
+## 2. Actor 局部观测，93 维
 
-每个拖轮的 actor 输入是一个 86 维向量。环境仍返回扁平向量，actor 内部再切分为自身主观测和邻居 attention 输入。
+每个拖轮的 actor 输入是一个 93 维向量。环境仍返回扁平向量，actor 内部再切分为自身主观测和邻居 attention 输入。
 
 | 索引范围 | 维数 | 名称 |
 |---:|---:|---|
-| 0-27 | 28 | 自身运动历史 |
-| 28-43 | 16 | 执行机构命令历史 |
-| 44-49 | 6 | 大船相对状态 |
-| 50-55 | 6 | 大船轨迹前瞻 |
-| 56-85 | 30 | 邻居 attention 输入（碰撞风险特征） |
+| 0-23 | 24 | 自身运动历史 |
+| 24-39 | 16 | 执行机构命令历史 |
+| 40-44 | 5 | 大船相对状态 |
+| 45-50 | 6 | 大船轨迹前瞻 |
+| 51-55 | 5 | 本 agent 目标 slot |
+| 56-59 | 4 | 当前 route 目标与进度 |
+| 60-62 | 3 | 最近船体边界向量与距离 |
+| 63-92 | 30 | 邻居 attention 输入（碰撞风险特征） |
 
 Actor 内部切片为：
 
 $$
-o_i^{\mathrm{own}} = o_i[0:56],
+o_i^{\mathrm{own}} = o_i[0:63],
 \qquad
-o_i^{\mathrm{nbr}} = \mathrm{reshape}(o_i[56:86], 3, 10).
+o_i^{\mathrm{nbr}} = \mathrm{reshape}(o_i[63:93], 3, 10).
 $$
 
-## 3. 自身运动历史，28 维
+## 3. 自身运动历史，24 维
 
 历史长度为当前帧加过去 3 帧，共 4 帧。顺序是从新到旧：
 
@@ -56,15 +59,14 @@ $$
 t,\; t-1,\; t-2,\; t-3.
 $$
 
-每一帧包含 7 个量：
+每一帧包含 6 个量。该块不再使用世界系绝对航向 `sin(psi), cos(psi)`，而是显式给出拖轮偏航角速度 `r`，减少旋转不变任务中的无关输入：
 
 $$
 h_i^\tau =
 \left[
 \frac{u_i^\tau}{5},
 \frac{v_i^\tau}{5},
-\sin\psi_i^\tau,
-\cos\psi_i^\tau,
+\frac{r_i^\tau}{0.5},
 \frac{\Delta u_i^\tau}{5},
 \frac{\Delta v_i^\tau}{5},
 \frac{\Delta r_i^\tau}{0.5}
@@ -84,7 +86,7 @@ $$
 因此自身运动历史块为：
 
 $$
-o_{i,0:28}
+o_{i,0:24}
 =
 \left[
 h_i^t,\;
@@ -115,7 +117,7 @@ $$
 动作历史同样按从新到旧排列：
 
 $$
-o_{i,28:44}
+o_{i,24:40}
 =
 \left[
 a_i^t,\;
@@ -127,7 +129,7 @@ $$
 
 其中 `n_L, n_R` 是左右推进器转速命令，`delta_L, delta_R` 是左右推进器方位角命令。reset 时，历史全部用初始动作填充。
 
-## 5. 大船相对状态，6 维
+## 5. 大船相对状态，5 维
 
 大船中心相对拖轮 `i` 的世界系位移为：
 
@@ -154,19 +156,18 @@ $$
 大船相对状态块为：
 
 $$
-o_{i,44:50}
+o_{i,40:45}
 =
 \left[
 \frac{\Delta x_{s,i}^{\mathrm{ego}}}{100},
 \frac{\Delta y_{s,i}^{\mathrm{ego}}}{100},
 \frac{u_s}{3},
-\frac{v_s}{3},
 \sin(\psi_s-\psi_i),
 \cos(\psi_s-\psi_i)
 \right].
 $$
 
-这里 `u_s, v_s` 是大船自身船体系速度。
+这里 `u_s` 是大船自身船体系纵向速度。当前大船模型不使用横向速度，`v_s` 不再进入 actor 观测。
 
 ## 6. 大船轨迹前瞻，6 维
 
@@ -234,7 +235,7 @@ $$
 最终前瞻块为：
 
 $$
-o_{i,50:56}
+o_{i,45:51}
 =
 \left[
 \frac{\Delta x_{s,i}^{\mathrm{ego}}(\tau_1)}{100},
@@ -246,9 +247,113 @@ o_{i,50:56}
 \right].
 $$
 
-## 7. 邻居 attention 输入，30 维
+## 7. 本 agent 目标 slot，5 维
 
-当前默认 4 条拖轮。对拖轮 `i`，其邻居是其余 3 条拖轮，按 tug index 固定顺序排列。每个邻居从纯几何状态升级为碰撞风险特征，使本船特征（56 维）与邻居特征（3×10=30 维）维度更对等。
+每个拖轮 `i` 被分配到一个固定目标 slot。目标 slot 的世界系位置与期望航向记为：
+
+$$
+s_i = (x_{\mathrm{slot},i}, y_{\mathrm{slot},i}, \psi_{\mathrm{slot},i}).
+$$
+
+slot 相对拖轮的位移投影到拖轮自身坐标系：
+
+$$
+\begin{bmatrix}
+\Delta x_{\mathrm{slot},i}^{\mathrm{ego}} \\
+\Delta y_{\mathrm{slot},i}^{\mathrm{ego}}
+\end{bmatrix}
+=
+R(-\psi_i)
+\begin{bmatrix}
+x_{\mathrm{slot},i} - x_i \\
+y_{\mathrm{slot},i} - y_i
+\end{bmatrix}.
+$$
+
+目标 slot 块为：
+
+$$
+o_{i,51:56}
+=
+\left[
+\frac{\Delta x_{\mathrm{slot},i}^{\mathrm{ego}}}{100},
+\frac{\Delta y_{\mathrm{slot},i}^{\mathrm{ego}}}{100},
+\min\!\left(\frac{d_{\mathrm{slot},i}}{100}, 10\right),
+\sin(\psi_{\mathrm{slot},i}-\psi_i),
+\cos(\psi_{\mathrm{slot},i}-\psi_i)
+\right].
+$$
+
+这 5 维是共享 actor 区分不同 agent 目标的关键输入。
+
+## 8. 当前 route 目标与进度，4 维
+
+环境为每艘拖轮维护一条从初始位置到目标 slot 的 route。actor 观测当前 route stage 对应的 waypoint，而不只看最终 slot。
+
+当前 route 目标点相对拖轮的位移投影到拖轮自身坐标系：
+
+$$
+\begin{bmatrix}
+\Delta x_{\mathrm{route},i}^{\mathrm{ego}} \\
+\Delta y_{\mathrm{route},i}^{\mathrm{ego}}
+\end{bmatrix}
+=
+R(-\psi_i)
+\begin{bmatrix}
+x_{\mathrm{route},i} - x_i \\
+y_{\mathrm{route},i} - y_i
+\end{bmatrix}.
+$$
+
+route 块为：
+
+$$
+o_{i,56:60}
+=
+\left[
+\frac{\Delta x_{\mathrm{route},i}^{\mathrm{ego}}}{100},
+\frac{\Delta y_{\mathrm{route},i}^{\mathrm{ego}}}{100},
+\frac{\mathrm{stage}_i}{N_{\mathrm{route},i}-1},
+\frac{D_{\mathrm{remaining},i}}{500}
+\right].
+$$
+
+其中 stage 归一化项会裁剪到 `[0, 1]`。
+
+## 9. 最近船体边界向量与距离，3 维
+
+为了让 actor 直接感知船体安全边界，环境计算拖轮到大船矩形碰撞 hull 的最近点。最近点先在大船船体系中计算，再转回世界系并投影到拖轮自身坐标系：
+
+$$
+\begin{bmatrix}
+\Delta x_{\mathrm{hull},i}^{\mathrm{ego}} \\
+\Delta y_{\mathrm{hull},i}^{\mathrm{ego}}
+\end{bmatrix}
+=
+R(-\psi_i)
+\begin{bmatrix}
+x_{\mathrm{hull},i}^{*} - x_i \\
+y_{\mathrm{hull},i}^{*} - y_i
+\end{bmatrix}.
+$$
+
+hull 块为：
+
+$$
+o_{i,60:63}
+=
+\left[
+\frac{\Delta x_{\mathrm{hull},i}^{\mathrm{ego}}}{50},
+\frac{\Delta y_{\mathrm{hull},i}^{\mathrm{ego}}}{50},
+\frac{d_{\mathrm{hull},i}}{50}
+\right].
+$$
+
+其中 `d_hull` 与碰撞检测使用的 hull 距离定义一致。
+
+## 10. 邻居 attention 输入，30 维
+
+当前默认 4 条拖轮。对拖轮 `i`，其邻居是其余 3 条拖轮，按 tug index 固定顺序排列。每个邻居从纯几何状态升级为碰撞风险特征，使本船特征（63 维）与邻居特征（3×10=30 维）维度更对等。
 
 邻居 `j` 相对拖轮 `i` 的位置投影到拖轮 `i` 自身坐标系：
 
@@ -350,7 +455,7 @@ $$
 3 个邻居拼接为：
 
 $$
-o_{i,56:86}
+o_{i,63:93}
 =
 \left[
 b_{j_1|i},\;
@@ -359,12 +464,12 @@ b_{j_3|i}
 \right].
 $$
 
-## 8. Actor attention 网络如何使用观测
+## 11. Actor attention 网络如何使用观测
 
-Actor 将 86 维输入切成自身主观测和邻居观测：
+Actor 将 93 维输入切成自身主观测和邻居观测：
 
 $$
-o_i^{\mathrm{own}} \in \mathbb{R}^{56},
+o_i^{\mathrm{own}} \in \mathbb{R}^{63},
 \qquad
 o_i^{\mathrm{nbr}} \in \mathbb{R}^{3\times 10}.
 $$
@@ -435,33 +540,30 @@ $$
 
 最终输出 4 维动作均值，动作分布仍是 tanh-squashed diagonal Gaussian。
 
-## 9. Centralized Critic 全局状态，121 维
+## 12. Centralized Critic 全局状态，90 维
 
-MAPPO critic 不使用 actor 的 86 维局部观测，而是使用 `get_global_state()` 构造的 canonical global state。默认 4 条拖轮时维度为：
+MAPPO critic 不使用 actor 的 93 维局部观测，而是使用 `get_global_state()` 构造的 canonical global state。默认 4 条拖轮时维度为：
 
 $$
-5 + 4\times 23 + 4\times 6 = 121.
+2 + 4\times 19 + 4\times 3 = 90.
 $$
 
-### 9.1 大船段，5 维
+### 12.1 大船段，2 维
 
 $$
 s_{\mathrm{ship}}
 =
 \left[
 \frac{u_s}{5},
-\frac{v_s}{5},
-\frac{r_s}{0.05},
-\frac{L_s}{L_0}-1,
-\frac{B_s}{B_0}-1
+\frac{\dot u_s}{0.2}
 \right].
 $$
 
-其中 `L_0 = EnvConfig.ship_length_m`，`B_0 = EnvConfig.ship_beam_m`。
+当前大船模型直行且不使用横向速度、偏航角速度；船长和船宽默认不随机化，因此这些常量不再进入 critic。
 
-### 9.2 每条拖轮段，23 维
+### 12.2 每条拖轮段，19 维
 
-对每条拖轮，critic 使用大船船体系下的位置、速度、相对朝向、执行器、动作、slot 角色、route 进度和船体距离。
+对每条拖轮，critic 使用大船船体系下的位置、速度、相对朝向、执行器、动作、route 进度和船体距离。固定 `tug_to_slot = arange(n_tugs)` 下的 slot one-hot 是常量，已从 critic 状态中移除。
 
 | 相对索引 | 维数 | 内容 |
 |---:|---:|---|
@@ -471,15 +573,14 @@ $$
 | 6 | 1 | 拖轮偏航角速度，除以 0.5 |
 | 7-10 | 4 | 执行器实际值，已归一化 |
 | 11-14 | 4 | 上一步动作 |
-| 15-18 | 4 | slot one-hot |
-| 19 | 1 | route stage 进度 |
-| 20 | 1 | route remaining，除以 500 |
-| 21 | 1 | in-zone hold 进度 |
-| 22 | 1 | 到大船船体的最近距离，除以 50 |
+| 15 | 1 | route stage 进度 |
+| 16 | 1 | route remaining，除以 500 |
+| 17 | 1 | in-zone hold 进度 |
+| 18 | 1 | 到大船船体的最近距离，除以 50 |
 
-### 9.3 每条拖轮加速度 tail，6 维
+### 12.3 每条拖轮加速度 tail，3 维
 
-每条拖轮在全局状态末尾还有 6 维加速度 tail：
+每条拖轮在全局状态末尾还有 3 维拖轮自身加速度 tail：
 
 $$
 s_{i}^{\mathrm{acc}}
@@ -487,16 +588,13 @@ s_{i}^{\mathrm{acc}}
 \left[
 \frac{a_{x,i}^{\mathrm{ship}}}{1.0},
 \frac{a_{y,i}^{\mathrm{ship}}}{1.0},
-\frac{\dot r_i}{0.1},
-\frac{\dot u_s}{0.2},
-\frac{\dot v_s}{0.2},
-\frac{\dot r_s}{0.01}
+\frac{\dot r_i}{0.1}
 \right].
 $$
 
-其中拖轮线加速度先从拖轮自身体系转到世界系，再投影到大船船体系。
+其中拖轮线加速度先从拖轮自身体系转到世界系，再投影到大船船体系。大船纵向加速度已放入大船段一次，不再在每条拖轮 tail 中重复。
 
-## 10. 数值裁剪
+## 13. 数值裁剪
 
 Actor 观测和 critic 全局状态在返回前都会做统一裁剪：
 

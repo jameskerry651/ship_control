@@ -54,15 +54,17 @@ class TugboatDynamicsModel:
 
     # 附加质量与附加转动惯量比例
     added_mass_surge_ratio: float = 0.08
-    added_mass_sway_ratio: float = 0.60
+    added_mass_sway_ratio: float = 0.30
     added_inertia_yaw_ratio: float = 0.55
 
     # 水动力阻尼参数
     rho_water: float = 1025.0
-    cd_surge: float = 0.25
-    cd_sway: float = 1.20
+    cd_surge: float = 0.70
+    cd_sway: float = 4.00
     linear_damping_ratio: float = 0.20
-    yaw_damping_gain: float = 6.0
+    # 线性阻尼参考速度尺度：把二次阻尼系数（kg/m）换算成线性阻尼系数（kg/s）。
+    linear_damping_ref_speed: float = 1.0
+    yaw_damping_gain: float = 15.0
 
     # 螺旋桨推力模型参数
     prop_diameter_m: float = 2.4
@@ -75,10 +77,10 @@ class TugboatDynamicsModel:
 
     # 控制上限、执行器速率限制与积分选项
     rpm_limit: float = 240.0
-    azimuth_limit_deg: float = 45.0
-    rpm_rate_limit: float = 80.0
+    azimuth_limit_deg: float = 90.0
+    rpm_rate_limit: float = 120.0
     azimuth_rate_limit_deg: float = 30.0
-    use_rigid_body_coriolis_only: bool = True
+    use_rigid_body_coriolis_only: bool = False
     max_integration_step_s: float = 0.02
 
     # eta = [x, y, psi]：地理坐标系下的位置与航向
@@ -239,13 +241,18 @@ class TugboatDynamicsModel:
         a_front = self.beam_m * self.draft_m
         a_side = self.length_m * self.draft_m
 
+        # 二次阻尼系数（量纲 kg/m）：力 = 系数 * |速度| * 速度
         x_uu = 0.5 * self.rho_water * self.cd_surge * a_front
         y_vv = 0.5 * self.rho_water * self.cd_sway * a_side
         n_rr = y_vv * self.length_m * self.length_m / 12.0
 
-        x_u = x_uu * self.linear_damping_ratio
-        y_v = y_vv * self.linear_damping_ratio
-        n_r = n_rr * self.linear_damping_ratio * self.yaw_damping_gain
+        # 线性阻尼系数：用参考速度尺度把 kg/m 换算成 kg/s，保证线性项也是力。
+        # 平动用参考速度 u_ref，偏航用对应的参考角速度 u_ref / length。
+        u_ref = max(self.linear_damping_ref_speed, 1e-6)
+        r_ref = u_ref / max(self.length_m, 1e-6)
+        x_u = x_uu * u_ref * self.linear_damping_ratio
+        y_v = y_vv * u_ref * self.linear_damping_ratio
+        n_r = n_rr * r_ref * self.linear_damping_ratio * self.yaw_damping_gain
         n_rr *= self.yaw_damping_gain
 
         u, v, r = self.nu.x, self.nu.y, self.nu.z

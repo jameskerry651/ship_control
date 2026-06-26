@@ -31,8 +31,6 @@ R_{i,t}
 w_{\mathrm{target}} R_{\mathrm{target},i}
 +
 w_{\mathrm{velocity}} R_{\mathrm{velocity},i}
-+
-w_{\mathrm{control}} R_{\mathrm{control},i}
 -
 w_{\mathrm{collision}} P_{\mathrm{collision},i}.
 $$
@@ -43,10 +41,9 @@ $$
 |---|---|---:|
 | `w_target` | `reward_target_w` | 1.0 |
 | `w_velocity` | `reward_velocity_w` | 0.25 |
-| `w_control` | `reward_control_w` | 0.08 |
-| `w_collision` | `reward_collision_w` | 2.0 |
+| `w_collision` | `reward_collision_w` | 5.0 |
 
-`R_target` 越大越好；`R_velocity` 和 `R_control` 是非正惩罚项；`P_collision` 是非负风险项，因此在总奖励中显式减去。
+`R_target` 越大越好；`R_velocity` 是非正惩罚项；`P_collision` 是非负风险项，因此在总奖励中显式减去。
 
 ## 3. 符号定义
 
@@ -282,6 +279,18 @@ R_{\mathrm{chase},i}
 R_{\mathrm{hold},i}.
 $$
 
+严格位置课程还可额外打开两个默认关闭的近场项。`R_precision` 在靠近 slot 时提供连续精度梯度；`R_near_hold` 不会在 `d_i > pos_tol_m` 立刻归零，用于把确定性 mean policy 从 60 m 继续拉向 20 m：
+
+$$
+R_{\mathrm{near\_hold},i}
+=
+w_{\mathrm{near}}
+\, 
+\exp\left[-\left(\frac{d_i}{D_{\mathrm{near}}}\right)^2\right]
+\, 
+\left(0.4 + 0.3s_{\psi,i} + 0.3s_{v,i}\right).
+$$
+
 默认配置：
 
 | 参数 | 配置项 | 默认值 |
@@ -289,8 +298,12 @@ $$
 | `D_progress` | `reward_target_progress_clip_m` | 1.5 m |
 | `V_chase` | `reward_chase_speed_target_ms` | 0.8 m/s |
 | `D_hold_start` | `reward_hold_start_m` | 140.0 m |
-| `D_hold_full` | `reward_hold_full_m` | 60.0 m |
-| `D_pos_tol` | `pos_tol_m` | 60.0 m |
+| `D_hold_full` | `reward_hold_full_m` | 20.0 m |
+| `D_pos_tol` | `pos_tol_m` | 140.0 m default; strict curriculum target 20.0 m |
+| `w_precision` | `reward_precision_w` | 0.0 default; strict curriculum enables it |
+| `D_precision` | `reward_precision_scale_m` | 40.0 m |
+| `w_near` | `reward_near_hold_w` | 0.0 default; strict curriculum enables it |
+| `D_near` | `reward_near_hold_scale_m` | 80.0 m |
 | `psi_tol` | `heading_tol_rad` | 30 deg |
 | `V_tol` | `speed_tol_ms` | 3.0 m/s |
 
@@ -379,81 +392,7 @@ $$
 | `V_scale` | `reward_velocity_speed_scale_ms` | 3.0 m/s |
 | `R_scale` | `reward_velocity_yaw_scale_rads` | 0.05 rad/s |
 
-## 6. 操作平滑控制
-
-设计目的：让拖轮控制平滑，避免频繁打舵和大幅度调整转速。
-
-动作定义：
-
-$$
-a_{i,t}
-=
-\left[
-n_{L,i,t},
-n_{R,i,t},
-\delta_{L,i,t},
-\delta_{R,i,t}
-\right],
-\qquad
-a_{i,t} \in [-1,1]^4.
-$$
-
-一阶动作变化：
-
-$$
-\Delta a_{i,t}
-=
-a_{i,t}
--
-a_{i,t-1}.
-$$
-
-二阶动作变化：
-
-$$
-\Delta^2 a_{i,t}
-=
-\Delta a_{i,t}
--
-\Delta a_{i,t-1}.
-$$
-
-最终 control reward：
-
-$$
-R_{\mathrm{control},i}
-=
--
-\left(
-c_{\Delta}
-\operatorname{mean}
-\left(
-(\Delta a_{i,t})^2
-\right)
-+
-c_J
-\operatorname{mean}
-\left(
-(\Delta^2 a_{i,t})^2
-\right)
-+
-c_A
-\operatorname{mean}
-\left(
-a_{i,t}^2
-\right)
-\right).
-$$
-
-默认配置：
-
-| 参数 | 配置项 | 默认值 |
-|---|---|---:|
-| `c_delta` | `reward_control_delta_w` | 1.0 |
-| `c_J` | `reward_control_jerk_w` | 0.5 |
-| `c_A` | `reward_control_mag_w` | 0.05 |
-
-## 7. 碰撞惩罚
+## 6. 碰撞惩罚
 
 设计目的：避免拖轮之间碰撞，以及拖轮与大船船体碰撞。实际碰撞会触发 episode 终止，并额外施加终端惩罚。
 
@@ -465,18 +404,31 @@ B(d; d_{\mathrm{collision}}, d_{\mathrm{safe}})
 \begin{cases}
 0,
 & d \ge d_{\mathrm{safe}}, \\
-\left[
 \operatorname{clip}
 \left(
 \frac{d_{\mathrm{safe}} - d}
 {d_{\mathrm{safe}} - d_{\mathrm{collision}}},
 0,
 1
-\right)
-\right]^2,
+\right),
 & d < d_{\mathrm{safe}}.
 \end{cases}
 $$
+
+CPA 时间权重在短时会遇时更强，超过预判窗口则不计入 CPA 风险：
+
+$$
+T(t_{\mathrm{cpa}})
+=
+\operatorname{clip}
+\left(
+1 - \frac{t_{\mathrm{cpa}}}{T_{\mathrm{horizon}}},
+0,
+1
+\right).
+$$
+
+只有当相对速度正在接近且 `TCPA` 位于预判窗口内时，CPA 项才生效。相对静止、正在远离或窗口外的会遇不产生 CPA 惩罚。
 
 拖轮与大船船体风险：
 
@@ -488,8 +440,19 @@ B
 d_{\mathrm{hull},i};
 D_{\mathrm{ship,collision}},
 D_{\mathrm{ship,safe}}
-\right).
+\right)
++
+c_{\mathrm{cpa}}
+B
+\left(
+D^{\mathrm{CPA}}_{\mathrm{hull},i};
+D_{\mathrm{ship,collision}},
+D_{\mathrm{ship,safe}}
+\right)
+T(t^{\mathrm{CPA}}_{\mathrm{ship},i}).
 $$
+
+第一项表示当前进入船体安全区后的持续距离惩罚；第二项表示预测会遇风险。`D^{CPA}_{hull}` 不是到大船中心的距离，而是在 CPA 时刻按未来大船位姿计算拖轮到矩形船体边界的距离。
 
 拖轮之间风险：
 
@@ -497,12 +460,23 @@ $$
 P_{\mathrm{tug},i}
 =
 \sum_{j \ne i}
+\left[
 B
 \left(
 d_{ij};
 D_{\mathrm{tug,collision}},
 D_{\mathrm{tug,safe}}
-\right).
+\right)
++
+c_{\mathrm{cpa}}
+B
+\left(
+D^{\mathrm{CPA}}_{ij};
+D_{\mathrm{tug,collision}},
+D_{\mathrm{tug,safe}}
+\right)
+T(t^{\mathrm{CPA}}_{ij})
+\right].
 $$
 
 总碰撞风险：
@@ -520,11 +494,13 @@ $$
 | 参数 | 配置项 | 默认值 |
 |---|---|---:|
 | `D_ship_collision` | `ship_collision_dist_m` | 6.0 m |
-| `D_ship_safe` | `reward_collision_ship_safe_m` | 30.0 m |
+| `D_ship_safe` | `reward_collision_ship_safe_m` | 60.0 m |
 | `D_tug_collision` | `tug_collision_dist_m` | 20.0 m |
-| `D_tug_safe` | `reward_collision_tug_safe_m` | 60.0 m |
+| `D_tug_safe` | `reward_collision_tug_safe_m` | 80.0 m |
+| `T_horizon` | `reward_cpa_horizon_s` | 60.0 s |
+| `c_cpa` | `reward_collision_cpa_w` | 2.0 |
 
-## 8. 终端信号
+## 7. 终端信号
 
 Dense reward 不直接包含成功 bonus 和硬碰撞终端惩罚。`FormationEnv.step()` 在终止判定后额外处理：
 
@@ -553,9 +529,9 @@ R_{\mathrm{terminal},i}
 \mathrm{reward\_collision\_pen}.
 $$
 
-拖轮与大船碰撞时，只惩罚肇事拖轮；拖轮之间碰撞时，惩罚发生碰撞的两艘拖轮。
+当前合作式环境中，发生碰撞时 episode 终止，所有拖轮都会收到同量级终端碰撞惩罚。
 
-## 9. 诊断字段
+## 8. 诊断字段
 
 `info["reward_components"]` 输出以下字段，用于训练日志和可视化：
 
@@ -566,10 +542,14 @@ $$
 | `r_chase` | 远场追赶 SLOT 奖励 |
 | `r_hold` | 近场稳定保持奖励 |
 | `r_velocity` | 速度与偏航角速度匹配奖励 |
-| `r_control` | 操作平滑奖励 |
 | `p_collision` | 总连续碰撞风险 |
 | `p_ship_collision` | 拖轮-大船连续碰撞风险 |
 | `p_tug_collision` | 拖轮-拖轮连续碰撞风险 |
+| `p_cpa_collision` | CPA 预判风险加权后的总贡献 |
+| `p_ship_cpa` | 拖轮-大船 CPA 预判风险，未乘 CPA 权重 |
+| `p_tug_cpa` | 拖轮-拖轮 CPA 预判风险，未乘 CPA 权重 |
+| `min_tcpa` | 当前拖轮最小有效 TCPA，单位 s；无有效 CPA 风险时为预判窗口 |
+| `min_dcpa` | 当前拖轮最小有效 DCPA，单位 m；无有效 CPA 风险时为安全距离上界 |
 | `dist_to_slot` | 拖轮到目标 SLOT 的距离 |
 | `heading_err_deg` | 航向误差，单位 degree |
 | `speed_err` | 世界系速度误差，单位 m/s |

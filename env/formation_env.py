@@ -31,6 +31,9 @@ from env.observer import (
     _ACTION_HISTORY_OBS_DIM,
     _SHIP_REL_OBS_DIM,
     _SHIP_PREVIEW_POINT_DIM,
+    _SLOT_TARGET_OBS_DIM,
+    _ROUTE_TARGET_OBS_DIM,
+    _HULL_CLEARANCE_OBS_DIM,
     _NEIGHBOR_COUNT,
     _NEIGHBOR_OBS_DIM,
     _GLOBAL_SHIP_DIM,
@@ -70,13 +73,16 @@ class FormationEnv:
     n_tugs: int = field(init=False)
     step_count: int = field(init=False)
     last_actions: np.ndarray = field(init=False)
-    last_action_changes: np.ndarray = field(init=False)
     motion_history: np.ndarray = field(init=False)
     action_history: np.ndarray = field(init=False)
     last_reward_components: dict = field(init=False)
     _route_waypoints_body_cache: dict[int, np.ndarray] = field(init=False)
     _mixed_ready_tugs: set[int] = field(init=False)
     prev_dist: np.ndarray = field(init=False)
+    prev_route_remaining: np.ndarray = field(init=False)
+    prev_d_hull: np.ndarray = field(init=False)
+    prev_speed_err: np.ndarray = field(init=False)
+    prev_heading_err: np.ndarray = field(init=False)
     in_zone_steps: np.ndarray = field(init=False)
     route_stage: np.ndarray = field(init=False)
     tug_to_slot: np.ndarray = field(init=False)
@@ -107,7 +113,6 @@ class FormationEnv:
         )
         self.step_count = 0
         self.last_actions = np.zeros((self.n_tugs, ACTION_DIM), dtype=np.float32)
-        self.last_action_changes = np.zeros((self.n_tugs, ACTION_DIM), dtype=np.float32)
         hist_len = int(getattr(self.cfg, "obs_history_k", 3)) + 1
         self.motion_history = np.zeros(
             (self.n_tugs, hist_len, _EGO_MOTION_OBS_DIM), dtype=np.float32
@@ -119,6 +124,10 @@ class FormationEnv:
         self._route_waypoints_body_cache = {}
         self._mixed_ready_tugs = set()
         self.prev_dist = np.zeros(self.n_tugs, dtype=np.float32)
+        self.prev_route_remaining = np.zeros(self.n_tugs, dtype=np.float32)
+        self.prev_d_hull = np.zeros(self.n_tugs, dtype=np.float32)
+        self.prev_speed_err = np.zeros(self.n_tugs, dtype=np.float32)
+        self.prev_heading_err = np.zeros(self.n_tugs, dtype=np.float32)
         self.in_zone_steps = np.zeros(self.n_tugs, dtype=np.int32)
         self.route_stage = np.zeros(self.n_tugs, dtype=np.int32)
         self.tug_to_slot = np.arange(self.n_tugs, dtype=np.int32)
@@ -139,6 +148,9 @@ class FormationEnv:
             + hist_len * _ACTION_HISTORY_OBS_DIM
             + _SHIP_REL_OBS_DIM
             + len(preview_times) * _SHIP_PREVIEW_POINT_DIM
+            + _SLOT_TARGET_OBS_DIM
+            + _ROUTE_TARGET_OBS_DIM
+            + _HULL_CLEARANCE_OBS_DIM
             + (self.n_tugs - 1) * _NEIGHBOR_OBS_DIM
         )
 
@@ -256,11 +268,12 @@ class FormationEnv:
 
         self.step_count = 0
         self.last_actions[:] = 0.0
-        self.last_action_changes[:] = 0.0
         self._ensure_history_buffers()
         self.motion_history[:] = 0.0
         self.action_history[:] = 0.0
         self.in_zone_steps[:] = 0
+        self.prev_route_remaining[:] = 0.0
+        self.prev_d_hull[:] = 0.0
         self.route_stage[:] = 0
         self._route_waypoints_body_cache.clear()
 
@@ -299,7 +312,6 @@ class FormationEnv:
                 tug.snap_actuators_to_commands()
 
         self.last_actions = init_actions.copy()
-        self.last_action_changes[:] = 0.0
         self._obs.fill_obs_history(init_actions)
 
         for i in range(self.n_tugs):
@@ -317,6 +329,11 @@ class FormationEnv:
         for i, tug in enumerate(self.tugs):
             slot = slot_world[self.tug_to_slot[i]]
             self.prev_dist[i] = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
+            self.prev_route_remaining[i] = float(self._route._route_remaining_distance(i))
+            self.prev_d_hull[i] = self.ship.distance_from_hull(tug.eta.x, tug.eta.y)
+            spd_err, head_err = self._tug_track_errors(tug, slot)
+            self.prev_speed_err[i] = spd_err
+            self.prev_heading_err[i] = head_err
 
         return self._obs.build_obs()
 
@@ -364,30 +381,56 @@ class FormationEnv:
 
         terminal_reward = np.zeros(self.n_tugs, dtype=np.float32)
         if term_info.get("collision"):
+            # P1 按责分配：肇事 tug 吃满 culprit 惩罚，其余 bystander 只共担小额。
+            # 消除"全员共担"导致 critic 无法归因碰撞回报的问题。
+            pen_culprit = float(
+                getattr(self.cfg, "reward_collision_pen_culprit", self.cfg.reward_collision_pen)
+            )
+            pen_bystander = float(
+                getattr(self.cfg, "reward_collision_pen_bystander", pen_culprit)
+            )
+            terminal_reward -= pen_bystander
             kind = term_info.get("collision_kind")
-            pen = float(self.cfg.reward_collision_pen)
-            if kind == "tug_vs_ship":
-                idx = int(term_info.get("collision_tug", 0))
-                terminal_reward[idx] -= pen
-            elif kind == "tug_vs_tug":
-                i, j = term_info.get("collision_pair", (0, 1))
-                terminal_reward[int(i)] -= pen
-                terminal_reward[int(j)] -= pen
+            if kind == "tug_vs_ship" and term_info.get("collision_tug") is not None:
+                terminal_reward[int(term_info["collision_tug"])] = -pen_culprit
+            elif kind == "tug_vs_tug" and term_info.get("collision_pair") is not None:
+                a, b = term_info["collision_pair"]
+                terminal_reward[int(a)] = -pen_culprit
+                terminal_reward[int(b)] = -pen_culprit
             else:
-                terminal_reward -= pen
+                terminal_reward[:] = -pen_culprit
         if term_info.get("success") and self.cfg.reward_arrival_bonus > 0.0:
             terminal_reward += float(self.cfg.reward_arrival_bonus)
         info["terminal_reward"] = terminal_reward
 
-        self.last_action_changes = actions - self.last_actions
         self.last_actions = actions.copy()
         self._obs.append_obs_history(actions, prev_nu)
         for i, tug in enumerate(self.tugs):
             slot = slot_world[self.tug_to_slot[i]]
             self.prev_dist[i] = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
+            self.prev_route_remaining[i] = float(self._route._route_remaining_distance(i))
+            self.prev_d_hull[i] = self.ship.distance_from_hull(tug.eta.x, tug.eta.y)
+            spd_err, head_err = self._tug_track_errors(tug, slot)
+            self.prev_speed_err[i] = spd_err
+            self.prev_heading_err[i] = head_err
 
         obs = self._obs.build_obs()
         return obs, rewards + terminal_reward, dones, info
+
+    def _tug_track_errors(self, tug, slot) -> tuple[float, float]:
+        """单艇相对大船的速度误差与航向误差（P3 势函数 shaping 用，单一来源避免公式重复）。"""
+        cs = math.cos(self.ship.psi)
+        sn = math.sin(self.ship.psi)
+        ship_vx = cs * self.ship.u - sn * self.ship.v
+        ship_vy = sn * self.ship.u + cs * self.ship.v
+        ci = math.cos(tug.eta.z)
+        si = math.sin(tug.eta.z)
+        tug_vx = ci * tug.nu.x - si * tug.nu.y
+        tug_vy = si * tug.nu.x + ci * tug.nu.y
+        speed_err = math.hypot(tug_vx - ship_vx, tug_vy - ship_vy)
+        dpsi = float(slot[2]) - tug.eta.z
+        dpsi = math.atan2(math.sin(dpsi), math.cos(dpsi))
+        return speed_err, abs(dpsi)
 
     def _apply_route_speed_governor(self, actions: np.ndarray) -> np.ndarray:
         if not bool(getattr(self.cfg, "route_speed_governor", False)):

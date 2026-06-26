@@ -54,13 +54,15 @@ class MAPPOActorCritic(nn.Module):
 
     def evaluate_for_agents(self, obs: torch.Tensor, global_state: torch.Tensor, agent_ids: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logprob, entropy = self.actor.evaluate_actions(obs, action)
-        values_all = self.critic.get_values(global_state)
+        # value 取 PopArt 归一化空间的输出，value loss 在归一化空间计算（量级稳定）
+        values_all = self.critic.normalized_values(global_state)
         value = values_all.gather(1, agent_ids.long().unsqueeze(1)).squeeze(1)
         return logprob, entropy, value
 
 
 @dataclass
 class MAPPORolloutBatch:
+    indices: torch.Tensor           # (B,) flat indices into rollout storage
     obs: torch.Tensor              # (B, obs_dim)
     global_state: torch.Tensor     # (B, global_state_dim)
     agent_ids: torch.Tensor        # (B,)
@@ -174,6 +176,7 @@ class MAPPORolloutBuffer:
         for start in range(0, B, batch_size):
             idx = indices[start : start + batch_size]
             yield MAPPORolloutBatch(
+                indices=idx,
                 obs=obs[idx],
                 global_state=global_state[idx],
                 agent_ids=agent_ids[idx],
@@ -201,6 +204,8 @@ class PPOUpdateStats:
     grad_norm: float
     learning_rate: float
     log_std_mean: float
+    success_bc_loss: float
+    success_bc_sample_count: int
 
 
 def _value_diagnostics(
@@ -240,6 +245,8 @@ def mappo_update(
     policy_coef: float = 1.0,
     collision_mask: torch.Tensor | None = None,
     noncollision_mask: torch.Tensor | None = None,
+    success_bc_coef: float = 0.0,
+    success_bc_mask: torch.Tensor | None = None,
 ) -> PPOUpdateStats:
     """MAPPO 更新：actor 用局部 obs，critic 用 centralized global obs。
 
@@ -249,9 +256,14 @@ def mappo_update(
     target_kl 早停只在 policy_coef > 0 时生效（warmup 阶段 KL 应恒为 0）。
     """
     pls, vls, ents, kls, clip_fracs, gnorms = [], [], [], [], [], []
+    bc_losses: list[float] = []
+    bc_counts: list[int] = []
 
     all_returns = buffer.returns.reshape(-1)
     all_values = buffer.values.reshape(-1)
+    success_bc_flat = None
+    if success_bc_mask is not None and success_bc_coef > 0.0:
+        success_bc_flat = success_bc_mask.reshape(-1).bool()
     var_y = all_returns.var(unbiased=False).clamp_min(1e-8)
     explained_variance = float(1.0 - (all_returns - all_values).var(unbiased=False) / var_y)
     value_loss_collision, ev_collision = _value_diagnostics(
@@ -262,6 +274,9 @@ def mappo_update(
     )
 
     stop_early = False
+    # PopArt：在 epoch 循环前用本轮真实尺度 returns 更新统计量并 rescale 输出层。
+    # 之后 critic 的 normalized_values 与 normalize_returns 在同一归一化空间对齐。
+    model.critic.update_popart(buffer.returns.reshape(-1))
     for _ in range(update_epochs):
         if stop_early:
             break
@@ -276,24 +291,51 @@ def mappo_update(
             surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * batch.advantages
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            value_pred_clipped = batch.old_values + torch.clamp(
-                new_value - batch.old_values, -value_clip_eps, value_clip_eps
+            # value loss 在 PopArt 归一化空间计算：把真实尺度的 returns/old_values
+            # 映射到归一化空间，再与 new_value（归一化输出）比较。value clip 同样在
+            # 归一化空间进行，量级稳定。
+            returns_n = model.critic.normalize_returns(batch.returns)
+            old_values_n = model.critic.normalize_returns(batch.old_values)
+            value_pred_clipped = old_values_n + torch.clamp(
+                new_value - old_values_n, -value_clip_eps, value_clip_eps
             )
-            value_loss_unclipped = (new_value - batch.returns).pow(2)
-            value_loss_clipped = (value_pred_clipped - batch.returns).pow(2)
+            value_loss_unclipped = (new_value - returns_n).pow(2)
+            value_loss_clipped = (value_pred_clipped - returns_n).pow(2)
             value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
             entropy_loss = -entropy.mean()
+            success_bc_loss = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
+            success_bc_count = 0
+            if (
+                policy_coef > 0.0
+                and success_bc_coef > 0.0
+                and success_bc_flat is not None
+            ):
+                bc_mask = success_bc_flat[batch.indices]
+                success_bc_count = int(bc_mask.sum().item())
+                if success_bc_count > 0:
+                    mean_action = torch.tanh(model.policy(batch.obs[bc_mask]))
+                    success_bc_loss = (mean_action - batch.actions[bc_mask]).pow(2).mean()
             loss = (
                 policy_coef * policy_loss
                 + value_coef * value_loss
                 + policy_coef * entropy_coef * entropy_loss
+                + policy_coef * float(success_bc_coef) * success_bc_loss
             )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
+            # MPS 数值稳定性保护：检测 NaN/Inf 梯度，跳过该 step 避免参数污染。
+            skip_step = False
+            for p in model.parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    skip_step = True
+                    break
+            if skip_step:
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
 
             with torch.no_grad():
                 approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
@@ -304,7 +346,10 @@ def mappo_update(
             ents.append(entropy.mean().item())
             kls.append(approx_kl)
             clip_fracs.append(clip_frac)
-            gnorms.append(float(grad_norm))
+            gnorms.append(float(grad_norm) if not skip_step else float("inf"))
+            if success_bc_count > 0:
+                bc_losses.append(float(success_bc_loss.item()))
+                bc_counts.append(success_bc_count)
 
             if policy_coef > 0.0 and target_kl > 0.0 and approx_kl > target_kl * 1.5:
                 stop_early = True
@@ -325,4 +370,6 @@ def mappo_update(
         grad_norm=float(np.mean(gnorms)) if gnorms else 0.0,
         learning_rate=lr,
         log_std_mean=float(model.log_std.detach().mean().item()),
+        success_bc_loss=float(np.mean(bc_losses)) if bc_losses else 0.0,
+        success_bc_sample_count=int(np.sum(bc_counts)) if bc_counts else 0,
     )

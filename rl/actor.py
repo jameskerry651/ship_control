@@ -12,8 +12,12 @@ from torch.distributions import Normal
 
 # tanh 动作压缩时的数值稳定项，避免 log(0) 与 atanh 边界溢出
 _ACTION_SQUASH_EPS = 1e-6
-# 本船历史观测维度（不含邻居信息）
-_OWN_OBS_DIM = 56
+# 本船历史观测维度（不含邻居信息）：
+# motion(4帧×6=24) + action(4帧×4=16) + ship_rel(5) + preview(3×2=6)
+# + slot_target(5) + route_target(4) + hull_clearance(3) = 63
+# 其中 slot_target=5 是本 agent 目标槽位的相对量，与 env/observer.py 的
+# _SLOT_TARGET_OBS_DIM 保持一致；缺它会导致共享策略无法区分各 agent 目标、相互碰撞。
+_OWN_OBS_DIM = 63
 # 参与 attention 的邻居数量
 _NEIGHBOR_COUNT = 3
 # 单个邻居观测维度：风险特征 [dx, dy, distance, sin(bearing), cos(bearing),
@@ -160,7 +164,7 @@ class MAPPOActor(nn.Module):
                 f"attention actor expects obs_dim={expected_obs_dim}, got {self.obs_dim}"
             )
 
-        # 本船特征编码器：将本船观测 (56维) 编码为 64 维特征向量
+        # 本船特征编码器：将本船观测 (63维) 编码为 64 维特征向量
         self.own_encoder = nn.Sequential(
             nn.Linear(self.own_obs_dim, 128),
             nn.LayerNorm(128),
@@ -202,7 +206,7 @@ class MAPPOActor(nn.Module):
 
         - 隐藏层（编码器 + Attention + Actor Head）使用正交初始化 (gain=√2)，
           配合 Tanh 激活函数，有助于缓解梯度消失/爆炸问题。
-        - 策略均值输出层使用极小增益 (gain=0.01) 的正交初始化，
+        - 策略均值输出层使用较小增益 (gain=0.1) 的正交初始化，
           使训练初期策略接近均匀随机，避免过早收敛到次优动作。
         - 所有偏置初始化为零。
         """
@@ -211,14 +215,14 @@ class MAPPOActor(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.orthogonal_(m.weight, gain=math.sqrt(2.0))
                     nn.init.zeros_(m.bias)
-        nn.init.orthogonal_(self.policy_mean.weight, gain=0.01)
+        nn.init.orthogonal_(self.policy_mean.weight, gain=0.1)
         nn.init.zeros_(self.policy_mean.bias)
 
     def _split_obs(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         将原始观测张量拆分为本船观测和邻居观测。
 
-        观测布局：[own_obs (56维) | neigh_0 (10维) | neigh_1 (10维) | neigh_2 (10维)]
+        观测布局：[own_obs (63维) | neigh_0 (10维) | neigh_1 (10维) | neigh_2 (10维)]
 
         Parameters
         ----------
@@ -228,7 +232,7 @@ class MAPPOActor(nn.Module):
         Returns
         -------
         own_obs : torch.Tensor
-            本船观测，shape=(..., 56)。
+            本船观测，shape=(..., 63)。
         neighbors_obs : torch.Tensor
             邻居观测，shape=(..., neighbor_count=3, neighbor_obs_dim=10)。
         """
