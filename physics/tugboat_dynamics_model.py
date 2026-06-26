@@ -66,6 +66,11 @@ class TugboatDynamicsModel:
     linear_damping_ref_speed: float = 1.0
     yaw_damping_gain: float = 15.0
 
+    # 横流诱导阻力耦合：回转大漂角时横向来流对纵向(surge)的诱导阻力，
+    # 使回转中纵向速度真实下降（真实 ASD 掉速 20–40%），并因 R=U/r 同步收紧回转圈。
+    # 该项 ∝ |v|*u，直航(v≈0)时自动消失，不影响顶速与第 1/2 层守恒测试。
+    cd_cross_coupling: float = 2.0
+
     # 尾鳍（skeg）升力参数：提供航向恢复力矩，对抗 Munk 力矩造成的航向不稳定。
     # 鳍处横向来流 v_local = v + r * skeg_x_m 产生攻角，升力 ≈ 0.5*rho*A*Cl_a*|u|*v_local，
     # 方向抵抗攻角，作用于艉部 → 恢复性偏航力矩。
@@ -263,8 +268,10 @@ class TugboatDynamicsModel:
         n_rr *= self.yaw_damping_gain
 
         u, v, r = self.nu.x, self.nu.y, self.nu.z
+        # 横流诱导纵向阻力：漂角产生横向来流 v 时，对 surge 施加附加阻力（∝|v|*u）。
+        x_cross = 0.5 * self.rho_water * self.cd_cross_coupling * a_front * abs(v) * u
         return Vec3(
-            x_u * u + x_uu * abs(u) * u,
+            x_u * u + x_uu * abs(u) * u + x_cross,
             y_v * v + y_vv * abs(v) * v,
             n_r * r + n_rr * abs(r) * r,
         )

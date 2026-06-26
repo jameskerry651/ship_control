@@ -335,8 +335,11 @@ def test_steady_state_thrust_balances_drag() -> None:
 # ==========================================================================
 
 def test_turning_circle_metrics() -> None:
-    """回转试验：稳态偏航角速度与回转半径应落在合理区间。"""
+    """回转试验：稳态偏航角速度、回转半径、回转掉速应落在真实 ASD 区间。"""
     log = run_turning_circle(azimuth_deg=35.0, duration_s=150.0)
+    # 进速：取回转前直航段（约 t=10s 打舵前）的航速作为基准
+    approach_idx = min(range(len(log.t)), key=lambda k: abs(log.t[k] - 10.0))
+    approach_speed = log.speed_ms[approach_idx]
     # 取后半段作为稳态
     half = len(log.yaw_rate_degs) // 2
     steady_r_degs = abs(sum(log.yaw_rate_degs[half:]) / (len(log.yaw_rate_degs) - half))
@@ -345,10 +348,13 @@ def test_turning_circle_metrics() -> None:
     # 回转中应保持前进航速（不塌陷/不倒退），这是 ASD 拖轮的真实特性
     steady_u = sum(log.u_ms[half:]) / (len(log.u_ms) - half)
     assert steady_u > 0.5, f"回转中纵向速度塌陷（u={steady_u:.2f}）"
-    # 回转半径 R = V / r（r 用 rad/s）。36m 拖轮约 1~3 倍船长
+    # 回转掉速：真实船舶硬回转掉速 20~40%，模型应体现明显掉速而非几乎不掉。
+    speed_loss = 1.0 - steady_speed / max(approach_speed, 1e-6)
+    assert 0.10 < speed_loss < 0.55, f"回转掉速 {speed_loss*100:.0f}% 偏离真实区间"
+    # 回转半径 R = V / r（r 用 rad/s）。真实 ASD 拖轮约 0.7~3 倍船长，远紧于常规舵船。
     r_rads = math.radians(steady_r_degs)
     radius_m = steady_speed / max(r_rads, 1e-6)
-    assert 15.0 < radius_m < 200.0, f"回转半径 {radius_m:.1f} m 超出合理范围"
+    assert 25.0 < radius_m < 110.0, f"回转半径 {radius_m:.1f} m 超出真实 ASD 区间"
 
 
 def test_zigzag_overshoot_is_bounded() -> None:
