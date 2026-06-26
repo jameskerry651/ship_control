@@ -104,6 +104,38 @@ def simulate(
     return log
 
 
+def run_spiral(
+    *, rpm: float = 240.0, az_max: float = 35.0, az_step: float = 2.5,
+    hold_s: float = 25.0, dt: float = 0.1,
+) -> dict[str, dict[float, float]]:
+    """螺旋试验：缓慢正反扫方位角，记录每个准稳态的偏航角速度（°/s）。
+
+    返回 {'down': {az: r_degs}, 'up': {az: r_degs}}。下扫/上扫两支不重合即为
+    回滞环，反映航向不稳定程度。
+    """
+    tug = make_tug()
+    for _ in range(int(15.0 / dt)):
+        tug.set_control_commands(rpm, rpm, 0.0, 0.0)
+        tug.step(dt)
+
+    res: dict[str, dict[float, float]] = {"down": {}, "up": {}}
+    a = az_max
+    while a >= -az_max - 1e-6:
+        for _ in range(int(hold_s / dt)):
+            tug.set_control_commands(rpm, rpm, a, a)
+            tug.step(dt)
+        res["down"][round(a, 1)] = math.degrees(tug.nu.z)
+        a -= az_step
+    a = -az_max
+    while a <= az_max + 1e-6:
+        for _ in range(int(hold_s / dt)):
+            tug.set_control_commands(rpm, rpm, a, a)
+            tug.step(dt)
+        res["up"][round(a, 1)] = math.degrees(tug.nu.z)
+        a += az_step
+    return res
+
+
 # --------------------------------------------------------------------------
 # 第 3 层会用到、export_maneuver_videos.py 也依赖的标准操纵动作
 # --------------------------------------------------------------------------
@@ -355,6 +387,29 @@ def test_acceleration_reaches_steady_speed() -> None:
     t_95 = next((log.t[i] for i, u in enumerate(log.u_ms) if u >= target), None)
     assert t_95 is not None and t_95 < 180.0, "加速过慢，未能逼近稳态航速"
     assert final_u > 1.0
+
+
+def test_spiral_hysteresis_in_realistic_range() -> None:
+    """螺旋试验：回滞环应小但非零——保留真实 ASD 拖轮的轻度航向不稳定，
+    同时不至于过度不稳定（舵居中时不应大幅自转）。"""
+    res = run_spiral()
+    # 舵居中(δ=0)时的稳态偏航：两支均值反映回滞半幅
+    center = (abs(res["down"][0.0]) + abs(res["up"][0.0])) / 2.0
+    assert center < 1.5, f"舵居中偏航 {center:.2f}°/s 过大，航向过度不稳定"
+
+    # 回滞环宽度：下扫/上扫过零点的方位角差
+    def zero_cross(branch: dict[float, float]) -> float:
+        items = sorted(branch.items())
+        prev = None
+        for a, r in items:
+            if prev is not None and prev[1] * r < 0:
+                a0, r0 = prev
+                return a0 + (a - a0) * (0.0 - r0) / (r - r0)
+            prev = (a, r)
+        return float("nan")
+
+    width = abs(zero_cross(res["down"]) - zero_cross(res["up"]))
+    assert width < 4.0, f"回滞环宽度 {width:.2f}° 过大，航向过度不稳定"
 
 
 if __name__ == "__main__":

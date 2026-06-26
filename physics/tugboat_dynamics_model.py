@@ -66,6 +66,13 @@ class TugboatDynamicsModel:
     linear_damping_ref_speed: float = 1.0
     yaw_damping_gain: float = 15.0
 
+    # 尾鳍（skeg）升力参数：提供航向恢复力矩，对抗 Munk 力矩造成的航向不稳定。
+    # 鳍处横向来流 v_local = v + r * skeg_x_m 产生攻角，升力 ≈ 0.5*rho*A*Cl_a*|u|*v_local，
+    # 方向抵抗攻角，作用于艉部 → 恢复性偏航力矩。
+    skeg_area_m2: float = 6.0
+    skeg_lift_slope: float = 3.0      # 升力线斜率 Cl_alpha（每弧度，含有效展弦比修正）
+    skeg_x_m: float = -15.0           # 鳍纵向位置（艉部，负值）
+
     # 螺旋桨推力模型参数
     prop_diameter_m: float = 2.4
     kt_forward: float = 0.40
@@ -275,16 +282,31 @@ class TugboatDynamicsModel:
 
         return Vec3(f_port.x + f_stbd.x, f_port.y + f_stbd.y, n_port + n_stbd)
 
+    # 尾鳍升力：鳍处横向来流产生攻角，升力抵抗攻角并在艉部形成恢复偏航力矩。
+    # 返回作用力/力矩 [Fx, Fy, N]（Fx≈0，鳍主要产生横向力与偏航力矩）。
+    def _skeg_forces(self) -> Vec3:
+        u, v, r = self.nu.x, self.nu.y, self.nu.z
+        # 鳍处横向局部来流速度（船体系 y 向）。
+        v_local = v + r * self.skeg_x_m
+        # 升力 ∝ 0.5*rho*A*Cl_alpha*|u|*v_local，方向抵抗局部横向来流（取负号）。
+        # 用 |u| 而非 u² 保证升力随纵向流速线性、随 v_local 线性（小攻角线化）。
+        fy = -0.5 * self.rho_water * self.skeg_area_m2 * self.skeg_lift_slope * abs(u) * v_local
+        # 力作用在 skeg_x_m 处：N = x * Fy（Fx 为 0）。
+        n = self.skeg_x_m * fy
+        return Vec3(0.0, fy, n)
+
     # 单个内部积分步。
     def _step_dynamics(self, delta: float) -> Vec3:
         tau = self._compute_tau()
         m_terms = self._mass_terms()
         cnu = self._coriolis_times_nu(m_terms)
         damping = self._damping_forces()
+        skeg = self._skeg_forces()
 
-        nu_dot_x = (tau.x - cnu.x - damping.x) / m_terms.x
-        nu_dot_y = (tau.y - cnu.y - damping.y) / m_terms.y
-        nu_dot_z = (tau.z - cnu.z - damping.z) / m_terms.z
+        # skeg 是外加水动力（恢复力），与控制 tau 同号进入分子、与阻尼/科氏反号。
+        nu_dot_x = (tau.x + skeg.x - cnu.x - damping.x) / m_terms.x
+        nu_dot_y = (tau.y + skeg.y - cnu.y - damping.y) / m_terms.y
+        nu_dot_z = (tau.z + skeg.z - cnu.z - damping.z) / m_terms.z
         self._last_nu_dot = Vec3(nu_dot_x, nu_dot_y, nu_dot_z)
 
         self.nu = Vec3(
