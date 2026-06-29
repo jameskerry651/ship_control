@@ -12,21 +12,22 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 
+from env.state import MutableEpisodeState, SimState
 from physics.large_ship_model import _wrap_pi
-
-if TYPE_CHECKING:
-    from env.formation_env import FormationEnv
 
 
 class FormationRewardComputer:
-    """Reward calculator for ``FormationEnv``."""
+    """Reward calculator for ``FormationEnv``.
 
-    def __init__(self, env: FormationEnv) -> None:
-        self._env = env
+    不持有 ``FormationEnv`` 引用，所有数据通过 ``SimState`` 和 ``MutableEpisodeState`` 传入。
+    """
+
+    def __init__(self) -> None:
+        pass
 
     @staticmethod
     def _world_velocity(psi: float, u: float, v: float) -> tuple[float, float]:
@@ -73,10 +74,14 @@ class FormationRewardComputer:
         return cls._barrier(dcpa, collision_distance, safe_distance) * time_weight
 
     def compute_rewards(
-        self, actions: np.ndarray, slot_world: np.ndarray
+        self,
+        state: SimState,
+        episode: MutableEpisodeState,
+        actions: np.ndarray,
+        slot_world: np.ndarray,
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        cfg = self._env.cfg
-        n = self._env.n_tugs
+        cfg = state.cfg
+        n = state.n_tugs
         rewards = np.zeros(n, dtype=np.float32)
 
         comp = {
@@ -115,16 +120,9 @@ class FormationRewardComputer:
             "route_chase": np.zeros(n, dtype=np.bool_),
         }
 
-        ship_vx_w, ship_vy_w = self._world_velocity(
-            self._env.ship.psi,
-            self._env.ship.u,
-            self._env.ship.v,
-        )
-        tug_positions = [(tug.eta.x, tug.eta.y) for tug in self._env.tugs]
-        tug_velocities = [
-            self._world_velocity(tug.eta.z, tug.nu.x, tug.nu.y)
-            for tug in self._env.tugs
-        ]
+        ship_vx_w, ship_vy_w = state.ship.world_velocity()
+        tug_positions = [(tug.x, tug.y) for tug in state.tugs]
+        tug_velocities = [tug.world_velocity() for tug in state.tugs]
 
         w_target = float(getattr(cfg, "reward_target_w", 1.0))
         w_velocity = float(getattr(cfg, "reward_velocity_w", 0.5))
@@ -210,19 +208,19 @@ class FormationRewardComputer:
         comp["min_tcpa"].fill(cpa_horizon_s)
         comp["min_dcpa"].fill(max(ship_safe_dist, tug_safe_dist))
 
-        for i, tug in enumerate(self._env.tugs):
-            slot = slot_world[self._env.tug_to_slot[i]]
-            d = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
-            dpsi = _wrap_pi(float(slot[2]) - tug.eta.z)
+        for i, tug in enumerate(state.tugs):
+            slot = slot_world[state.tug_to_slot[i]]
+            d = float(math.hypot(tug.x - slot[0], tug.y - slot[1]))
+            dpsi = _wrap_pi(float(slot[2]) - tug.psi)
 
-            route_len = len(self._env._route._route_waypoints_body_for_tug(i))
-            route_stage = int(np.clip(self._env.route_stage[i], 0, max(route_len - 1, 0)))
+            route_len = len(state.route_waypoints_body_for_tug(i))
+            route_stage = int(np.clip(state.route_stage[i], 0, max(route_len - 1, 0)))
             route_final = route_stage >= route_len - 1
-            route_target = self._env._route._current_route_target_world(i)
-            route_dx = float(route_target[0]) - tug.eta.x
-            route_dy = float(route_target[1]) - tug.eta.y
+            route_target = state.current_route_target_world(i)
+            route_dx = float(route_target[0]) - tug.x
+            route_dy = float(route_target[1]) - tug.y
             route_target_dist = float(math.hypot(route_dx, route_dy))
-            route_remaining = float(self._env._route._route_remaining_distance(i))
+            route_remaining = float(state.route_remaining_distance(i))
 
             tug_vx_w, tug_vy_w = tug_velocities[i]
             dvx = tug_vx_w - ship_vx_w
@@ -230,12 +228,12 @@ class FormationRewardComputer:
             speed_err = math.hypot(dvx, dvy)
 
             progress_score = float(
-                np.clip((float(self._env.prev_dist[i]) - d) / target_progress_clip, -1.0, 1.0)
+                np.clip((float(episode.prev_dist[i]) - d) / target_progress_clip, -1.0, 1.0)
             )
 
             if d > 1e-6:
-                los_x = (float(slot[0]) - tug.eta.x) / d
-                los_y = (float(slot[1]) - tug.eta.y) / d
+                los_x = (float(slot[0]) - tug.x) / d
+                los_y = (float(slot[1]) - tug.y) / d
             else:
                 los_x = math.cos(float(slot[2]))
                 los_y = math.sin(float(slot[2]))
@@ -243,14 +241,14 @@ class FormationRewardComputer:
             closing_score = float(np.clip(closing_speed / chase_speed_target, -1.0, 1.0))
 
             use_route_chase = bool(
-                self._env._uses_route_mode()
+                state.uses_route_mode
                 and not route_final
                 and d > float(cfg.pos_tol_m)
             )
             if use_route_chase and route_target_dist > 1e-6:
                 route_progress_score = float(
                     np.clip(
-                        (float(self._env.prev_route_remaining[i]) - route_remaining)
+                        (float(episode.prev_route_remaining[i]) - route_remaining)
                         / target_progress_clip,
                         -1.0,
                         1.0,
@@ -301,9 +299,9 @@ class FormationRewardComputer:
                 and speed_err < cfg.speed_tol_ms
             )
             if in_zone_now:
-                next_in_zone_steps = int(self._env.in_zone_steps[i]) + 1
+                next_in_zone_steps = int(episode.in_zone_steps[i]) + 1
             else:
-                next_in_zone_steps = max(0, int(self._env.in_zone_steps[i]) - streak_decay)
+                next_in_zone_steps = max(0, int(episode.in_zone_steps[i]) - streak_decay)
             r_hold = hold_gate * hold_score
             # P4 streak 稠密奖励：仅在区帧按连续步数占比给奖，激励逼近并维持 2s hold。
             if w_streak > 0.0 and in_zone_now:
@@ -314,7 +312,7 @@ class FormationRewardComputer:
 
             velocity_gate = hold_gate + (1.0 - hold_gate) * math.exp(-d / velocity_gate_scale)
             speed_pen = 1.0 - math.exp(-((speed_err / velocity_speed_scale) ** 2))
-            yaw_err = abs(tug.nu.z - self._env.ship.r)
+            yaw_err = abs(tug.r - state.ship.r)
             yaw_pen = 1.0 - math.exp(-((yaw_err / velocity_yaw_scale) ** 2))
             r_velocity = -velocity_gate * (0.8 * speed_pen + 0.2 * yaw_pen)
             if w_precision > 0.0:
@@ -330,25 +328,25 @@ class FormationRewardComputer:
             else:
                 r_near_hold = 0.0
 
-            d_hull = self._env.ship.distance_from_hull(tug.eta.x, tug.eta.y)
+            d_hull = state.ship.distance_from_hull(tug.x, tug.y)
             p_ship_proximity = self._barrier(
                 d_hull, cfg.ship_collision_dist_m, ship_safe_dist
             )
             ship_tcpa, _, ship_cpa_active = self._cpa_metrics(
-                tug.eta.x - self._env.ship.x,
-                tug.eta.y - self._env.ship.y,
+                tug.x - state.ship.x,
+                tug.y - state.ship.y,
                 tug_vx_w - ship_vx_w,
                 tug_vy_w - ship_vy_w,
                 cpa_horizon_s,
             )
             p_ship_cpa = 0.0
             if ship_cpa_active:
-                future_tug_x = tug.eta.x + tug_vx_w * ship_tcpa
-                future_tug_y = tug.eta.y + tug_vy_w * ship_tcpa
-                future_ship_x = self._env.ship.x + ship_vx_w * ship_tcpa
-                future_ship_y = self._env.ship.y + ship_vy_w * ship_tcpa
-                future_ship_psi = self._env.ship.psi + self._env.ship.r * ship_tcpa
-                ship_dcpa_hull = self._env._distance_from_ship_hull_pose(
+                future_tug_x = tug.x + tug_vx_w * ship_tcpa
+                future_tug_y = tug.y + tug_vy_w * ship_tcpa
+                future_ship_x = state.ship.x + ship_vx_w * ship_tcpa
+                future_ship_y = state.ship.y + ship_vy_w * ship_tcpa
+                future_ship_psi = state.ship.psi + state.ship.r * ship_tcpa
+                ship_dcpa_hull = state.ship.distance_from_hull_pose(
                     future_tug_x,
                     future_tug_y,
                     future_ship_x,
@@ -370,12 +368,12 @@ class FormationRewardComputer:
             for j, (other_x, other_y) in enumerate(tug_positions):
                 if j == i:
                     continue
-                d_pair = math.hypot(tug.eta.x - other_x, tug.eta.y - other_y)
+                d_pair = math.hypot(tug.x - other_x, tug.y - other_y)
                 p_tug += self._barrier(d_pair, cfg.tug_collision_dist_m, tug_safe_dist)
                 other_vx, other_vy = tug_velocities[j]
                 tug_tcpa, tug_dcpa, tug_cpa_active = self._cpa_metrics(
-                    other_x - tug.eta.x,
-                    other_y - tug.eta.y,
+                    other_x - tug.x,
+                    other_y - tug.y,
                     other_vx - tug_vx_w,
                     other_vy - tug_vy_w,
                     cpa_horizon_s,
@@ -398,9 +396,9 @@ class FormationRewardComputer:
             if w_shape > 0.0:
                 phi_cur = _potential(d, speed_err, abs(dpsi))
                 phi_prev = _potential(
-                    float(self._env.prev_dist[i]),
-                    float(self._env.prev_speed_err[i]),
-                    float(self._env.prev_heading_err[i]),
+                    float(episode.prev_dist[i]),
+                    float(episode.prev_speed_err[i]),
+                    float(episode.prev_heading_err[i]),
                 )
                 shaping = float(
                     np.clip(shape_gamma * phi_cur - phi_prev, -shape_clip, shape_clip)
@@ -422,7 +420,7 @@ class FormationRewardComputer:
             rewards[i] = r_total
 
             # next_in_zone_steps 已折入 streak 衰减（在区+1，违例-decay 不清零）。
-            self._env.in_zone_steps[i] = next_in_zone_steps
+            episode.in_zone_steps[i] = next_in_zone_steps
 
             comp["r_total"][i] = r_total
             comp["r_target"][i] = r_target
@@ -451,7 +449,7 @@ class FormationRewardComputer:
             comp["route_stage"][i] = float(route_stage)
             comp["route_remaining"][i] = route_remaining
             comp["route_target_dist"][i] = route_target_dist
-            comp["route_progress"][i] = float(self._env.prev_route_remaining[i]) - route_remaining
+            comp["route_progress"][i] = float(episode.prev_route_remaining[i]) - route_remaining
             comp["route_final"][i] = route_final
             comp["route_chase"][i] = use_route_chase
 

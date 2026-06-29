@@ -895,7 +895,7 @@ def main() -> None:
     best_eval_dist = float("inf")
     best_eval_pre_success_score = -float("inf")
     best_update = -1
-    best_success_margin = max(0.05, 2.0 / max(1, ppo_cfg.eval_episodes))
+    best_success_margin = max(0.01, 1.0 / max(1, ppo_cfg.eval_episodes))
     best_collision_guard = max(0.05, 3.0 / max(1, ppo_cfg.eval_episodes))
     early_stop_patience = 200
 
@@ -1211,8 +1211,26 @@ def main() -> None:
                     elif abs(collision_gain) <= best_collision_guard:
                         if cur_succ <= 0.0 and best_eval_succ <= 0.0:
                             is_better = cur_pre_success_score > best_eval_pre_success_score
-                        elif cur_succ >= best_eval_succ:
+                        elif cur_succ > best_eval_succ:
+                            is_better = True
+                        elif cur_succ >= best_eval_succ and collision_gain > 0.0:
+                            is_better = True
+                        elif cur_succ >= best_eval_succ and abs(collision_gain) <= 1e-12:
                             is_better = cur_ret > best_eval_return
+                else:
+                    if best_eval_succ >= 0.80:
+                        safety_success_floor = max(
+                            0.80,
+                            best_eval_succ - 1.5 * best_success_margin,
+                        )
+                    else:
+                        safety_success_floor = max(
+                            0.55,
+                            best_eval_succ - 1.5 * best_success_margin,
+                        )
+                    safety_clearly_better = collision_gain > 0.5 * best_collision_guard
+                    if cur_succ >= safety_success_floor and safety_clearly_better:
+                        is_better = True
             if is_better:
                 best_eval_succ = cur_succ
                 best_eval_collision = cur_coll

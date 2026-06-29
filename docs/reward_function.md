@@ -279,7 +279,7 @@ R_{\mathrm{chase},i}
 R_{\mathrm{hold},i}.
 $$
 
-严格位置课程还可额外打开两个默认关闭的近场项。`R_precision` 在靠近 slot 时提供连续精度梯度；`R_near_hold` 不会在 `d_i > pos_tol_m` 立刻归零，用于把确定性 mean policy 从 60 m 继续拉向 20 m：
+严格位置课程还可额外打开两个默认关闭的近场项。`R_precision` 在靠近 slot 时提供连续精度梯度；`R_near_hold` 不会在 `d_i > pos_tol_m` 立刻归零，用于把确定性 mean policy 从 60 m 继续拉向 10 m：
 
 $$
 R_{\mathrm{near\_hold},i}
@@ -299,7 +299,7 @@ $$
 | `V_chase` | `reward_chase_speed_target_ms` | 0.8 m/s |
 | `D_hold_start` | `reward_hold_start_m` | 140.0 m |
 | `D_hold_full` | `reward_hold_full_m` | 20.0 m |
-| `D_pos_tol` | `pos_tol_m` | 140.0 m default; strict curriculum target 20.0 m |
+| `D_pos_tol` | `pos_tol_m` | 140.0 m default; strict curriculum target 10.0 m |
 | `w_precision` | `reward_precision_w` | 0.0 default; strict curriculum enables it |
 | `D_precision` | `reward_precision_scale_m` | 40.0 m |
 | `w_near` | `reward_near_hold_w` | 0.0 default; strict curriculum enables it |

@@ -99,6 +99,16 @@ class EnvConfig:
     route_nonfinal_forward_action_cap: float = 0.45
     route_speed_governor_min_forward_action: float = 0.05
     route_speed_governor_cap_slope: float = 0.30
+    route_guidance_blend: float = 0.0           # 非 final route 段动作与 LOS waypoint guidance 的混合比例
+    route_guidance_forward_action: float = 0.28 # LOS guidance 期望的归一化前进指令
+    route_guidance_turn_action: float = 0.0
+    route_guidance_distance_scale_m: float = 120.0
+    route_guidance_allow_reverse: bool = True   # waypoint 落在后半平面时允许反向推力拉回路线
+    route_guidance_final_blend: float = 0.0      # final slot 段的 LOS/heading guidance，默认关闭
+    route_guidance_final_forward_action: float = 0.20
+    route_guidance_final_turn_action: float = 0.08
+    route_guidance_final_heading_turn_action: float = 0.12
+    route_guidance_final_distance_scale_m: float = 90.0
     route_outer_holding_extra_m: float = 18.0 # final approach 前保持在 slot 外侧的额外横距
     route_astar_cell_m: float = 4.0           # A* 网格分辨率 (m)
     route_astar_margin_m: float = 10.0        # A* 搜索区域相对起终点的额外边距

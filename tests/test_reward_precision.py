@@ -11,7 +11,7 @@ def _precision_components(weight: float) -> np.ndarray:
     env = FormationEnv(cfg=cfg, seed=123)
     env.reset()
     actions = np.zeros((cfg.n_tugs, env.action_dim), dtype=np.float32)
-    _, info = env._reward.compute_rewards(actions, env.ship.slot_positions_world())
+    _, info = env._compute_rewards(actions)
     return info["reward_components"]["r_precision"]
 
 
@@ -22,7 +22,7 @@ def _near_hold_components(weight: float) -> np.ndarray:
     env = FormationEnv(cfg=cfg, seed=123)
     env.reset()
     actions = np.zeros((cfg.n_tugs, env.action_dim), dtype=np.float32)
-    _, info = env._reward.compute_rewards(actions, env.ship.slot_positions_world())
+    _, info = env._compute_rewards(actions)
     return info["reward_components"]["r_near_hold"]
 
 

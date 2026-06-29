@@ -9,20 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
+from env.obs_spec import _NEIGHBOR_COUNT, _NEIGHBOR_OBS_DIM, _OWN_OBS_DIM
 
 # tanh 动作压缩时的数值稳定项，避免 log(0) 与 atanh 边界溢出
 _ACTION_SQUASH_EPS = 1e-6
-# 本船历史观测维度（不含邻居信息）：
-# motion(4帧×6=24) + action(4帧×4=16) + ship_rel(5) + preview(3×2=6)
-# + slot_target(5) + route_target(4) + hull_clearance(3) = 63
-# 其中 slot_target=5 是本 agent 目标槽位的相对量，与 env/observer.py 的
-# _SLOT_TARGET_OBS_DIM 保持一致；缺它会导致共享策略无法区分各 agent 目标、相互碰撞。
-_OWN_OBS_DIM = 63
-# 参与 attention 的邻居数量
-_NEIGHBOR_COUNT = 3
-# 单个邻居观测维度：风险特征 [dx, dy, distance, sin(bearing), cos(bearing),
-# du, dv, range_rate, tcpa, dcpa]，与 env/observer.py 保持一致
-_NEIGHBOR_OBS_DIM = 10
 # 邻居观测总维度，供 attention 模块输入
 _ATTENTION_OBS_DIM = _NEIGHBOR_COUNT * _NEIGHBOR_OBS_DIM
 _LOG_STD_INIT = -0.5

@@ -25,7 +25,7 @@ import numpy as np
 
 from config import EnvConfig
 from env.init import InitSampler
-from env.observer import (
+from env.obs_spec import (
     ACTION_DIM,
     _EGO_MOTION_OBS_DIM,
     _ACTION_HISTORY_OBS_DIM,
@@ -39,12 +39,19 @@ from env.observer import (
     _GLOBAL_SHIP_DIM,
     _GLOBAL_PER_TUG_DIM,
     _GLOBAL_ACCEL_PER_TUG_DIM,
-    Observer,
+)
+from env.observer import Observer
+from env.reward import FormationRewardComputer
+from env.route_planner import RoutePlanner
+from env.state import (
+    MutableEpisodeState,
+    SimState,
+    ShipSnapshot,
+    _make_ship_snapshot,
+    _make_tug_snapshot,
     local_to_world,
     world_to_local,
 )
-from env.reward import FormationRewardComputer
-from env.route_planner import RoutePlanner
 from physics.large_ship_model import LargeShipModel, _wrap_pi
 from physics.tugboat_dynamics_model import TugboatDynamicsModel, Vec3
 
@@ -76,22 +83,36 @@ class FormationEnv:
     motion_history: np.ndarray = field(init=False)
     action_history: np.ndarray = field(init=False)
     last_reward_components: dict = field(init=False)
-    _route_waypoints_body_cache: dict[int, np.ndarray] = field(init=False)
-    _mixed_ready_tugs: set[int] = field(init=False)
-    prev_dist: np.ndarray = field(init=False)
-    prev_route_remaining: np.ndarray = field(init=False)
-    prev_d_hull: np.ndarray = field(init=False)
-    prev_speed_err: np.ndarray = field(init=False)
-    prev_heading_err: np.ndarray = field(init=False)
-    in_zone_steps: np.ndarray = field(init=False)
-    route_stage: np.ndarray = field(init=False)
     tug_to_slot: np.ndarray = field(init=False)
+
+    # Agent-convenience aliases into _episode (backward compatible)
+    @property
+    def route_stage(self) -> np.ndarray:
+        return self._episode.route_stage
+    @route_stage.setter
+    def route_stage(self, val: np.ndarray) -> None:
+        self._episode.route_stage = val
+
+    @property
+    def _mixed_ready_tugs(self) -> set[int]:
+        return self._episode.mixed_ready_tugs
+    @_mixed_ready_tugs.setter
+    def _mixed_ready_tugs(self, val: set[int]) -> None:
+        self._episode.mixed_ready_tugs = val
+
+    @property
+    def in_zone_steps(self) -> np.ndarray:
+        return self._episode.in_zone_steps
+    @in_zone_steps.setter
+    def in_zone_steps(self, val: np.ndarray) -> None:
+        self._episode.in_zone_steps = val
 
     # 组合模块（在 __post_init__ 中创建）
     _route: RoutePlanner = field(init=False)
     _obs: Observer = field(init=False)
     _init: InitSampler = field(init=False)
     _reward: FormationRewardComputer = field(init=False)
+    _episode: MutableEpisodeState = field(init=False)
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.seed)
@@ -121,21 +142,25 @@ class FormationEnv:
             (self.n_tugs, hist_len, ACTION_DIM), dtype=np.float32
         )
         self.last_reward_components = {}
-        self._route_waypoints_body_cache = {}
-        self._mixed_ready_tugs = set()
-        self.prev_dist = np.zeros(self.n_tugs, dtype=np.float32)
-        self.prev_route_remaining = np.zeros(self.n_tugs, dtype=np.float32)
-        self.prev_d_hull = np.zeros(self.n_tugs, dtype=np.float32)
-        self.prev_speed_err = np.zeros(self.n_tugs, dtype=np.float32)
-        self.prev_heading_err = np.zeros(self.n_tugs, dtype=np.float32)
-        self.in_zone_steps = np.zeros(self.n_tugs, dtype=np.int32)
-        self.route_stage = np.zeros(self.n_tugs, dtype=np.int32)
+
+        # MutableEpisodeState 替代原来的散落字段
+        self._episode = MutableEpisodeState(
+            in_zone_steps=np.zeros(self.n_tugs, dtype=np.int32),
+            route_stage=np.zeros(self.n_tugs, dtype=np.int32),
+            route_waypoints_body_cache={},
+            mixed_ready_tugs=set(),
+            prev_dist=np.zeros(self.n_tugs, dtype=np.float32),
+            prev_route_remaining=np.zeros(self.n_tugs, dtype=np.float32),
+            prev_d_hull=np.zeros(self.n_tugs, dtype=np.float32),
+            prev_speed_err=np.zeros(self.n_tugs, dtype=np.float32),
+            prev_heading_err=np.zeros(self.n_tugs, dtype=np.float32),
+        )
         self.tug_to_slot = np.arange(self.n_tugs, dtype=np.int32)
 
-        self._route = RoutePlanner(self)
-        self._obs = Observer(self)
-        self._init = InitSampler(self)
-        self._reward = FormationRewardComputer(self)
+        self._route = RoutePlanner()
+        self._obs = Observer()
+        self._init = InitSampler()
+        self._reward = FormationRewardComputer()
 
     # ----------------------------------------------------------- properties
 
@@ -240,24 +265,39 @@ class FormationEnv:
         beam_lo, beam_hi = sorted((max(1.0, beam_min), max(1.0, beam_max)))
         self.ship.length_m = float(self.rng.uniform(length_lo, length_hi))
         self.ship.beam_m = float(self.rng.uniform(beam_lo, beam_hi))
-        self._route_waypoints_body_cache.clear()
+        self._episode.route_waypoints_body_cache.clear()
 
     # -------------------------------------------------------- route delegates
 
     def _route_waypoints_body_for_tug(self, tug_idx: int) -> np.ndarray:
-        return self._route._route_waypoints_body_for_tug(tug_idx)
+        return RoutePlanner._route_waypoints_body_for_tug(
+            self.cfg, _make_ship_snapshot(self.ship), self.tugs,
+            self.tug_to_slot, self._episode, tug_idx,
+        )
 
     def _route_waypoints_world_for_tug(self, tug_idx: int) -> np.ndarray:
-        return self._route._route_waypoints_world_for_tug(tug_idx)
+        return RoutePlanner._route_waypoints_world_for_tug(
+            self.cfg, _make_ship_snapshot(self.ship), self.tugs,
+            self.tug_to_slot, self._episode, tug_idx,
+        )
 
     def _advance_route_stage(self, tug_idx: int) -> None:
-        self._route._advance_route_stage(tug_idx)
+        RoutePlanner._advance_route_stage(
+            self.cfg, _make_ship_snapshot(self.ship), self.tugs,
+            self.tug_to_slot, self._episode, tug_idx,
+        )
 
     def _route_remaining_distance(self, tug_idx: int) -> float:
-        return self._route._route_remaining_distance(tug_idx)
+        return RoutePlanner._route_remaining_distance(
+            self.cfg, _make_ship_snapshot(self.ship), self.tugs,
+            self.tug_to_slot, self._episode, tug_idx,
+        )
 
     def _current_route_target_world(self, tug_idx: int) -> np.ndarray:
-        return self._route._current_route_target_world(tug_idx)
+        return RoutePlanner._current_route_target_world(
+            self.cfg, _make_ship_snapshot(self.ship), self.tugs,
+            self.tug_to_slot, self._episode, tug_idx,
+        )
 
     # ------------------------------------------------------------- reset
 
@@ -271,25 +311,24 @@ class FormationEnv:
         self._ensure_history_buffers()
         self.motion_history[:] = 0.0
         self.action_history[:] = 0.0
-        self.in_zone_steps[:] = 0
-        self.prev_route_remaining[:] = 0.0
-        self.prev_d_hull[:] = 0.0
-        self.route_stage[:] = 0
-        self._route_waypoints_body_cache.clear()
+        self._episode.in_zone_steps[:] = 0
+        self._episode.prev_route_remaining[:] = 0.0
+        self._episode.prev_d_hull[:] = 0.0
+        self._episode.route_stage[:] = 0
+        self._episode.route_waypoints_body_cache.clear()
 
         self._sample_ship_size()
         self.ship.reset(self.rng)
 
-        slot_world = self.ship.slot_positions_world()
         init_mode = self._init_mode()
-        tug_psi = np.zeros(self.n_tugs, dtype=np.float64)
-        tug_nu = np.zeros((self.n_tugs, 3), dtype=np.float64)
-        init_actions = np.zeros((self.n_tugs, ACTION_DIM), dtype=np.float32)
+        ship_snap = _make_ship_snapshot(self.ship)
 
-        self._mixed_ready_tugs = set()
+        self._episode.mixed_ready_tugs = set()
         if init_mode == "mixed_slot_approach":
             self.tug_to_slot = np.arange(self.n_tugs, dtype=np.int32)
-            tug_xy, tug_psi, tug_nu, init_actions = self._init.sample_mixed_slot_approach_states()
+            tug_xy, tug_psi, tug_nu, init_actions = InitSampler.sample_mixed_slot_approach_states(
+                self.rng, self.n_tugs, ship_snap, self.cfg, self._episode,
+            )
         else:
             raise ValueError(
                 f"未知 tug_init_mode: {init_mode!r}；"
@@ -312,30 +351,37 @@ class FormationEnv:
                 tug.snap_actuators_to_commands()
 
         self.last_actions = init_actions.copy()
-        self._obs.fill_obs_history(init_actions)
+        Observer.fill_obs_history(self.motion_history, self.action_history, self.tugs, init_actions)
+
+        # Pre-compute route waypoints for all tugs
+        for i in range(self.n_tugs):
+            RoutePlanner._route_waypoints_body_for_tug(
+                self.cfg, ship_snap, self.tugs, self.tug_to_slot, self._episode, i,
+            )
 
         for i in range(self.n_tugs):
-            self._route._route_waypoints_body_for_tug(i)
-
-        for i in range(self.n_tugs):
-            route_len = len(self._route._route_waypoints_body_for_tug(i))
+            route_len = len(self._episode.route_waypoints_body_cache.get(i, np.zeros((0, 2))))
             if not self._uses_route_mode(init_mode):
-                self.route_stage[i] = max(route_len - 1, 0)
-            elif init_mode == "mixed_slot_approach" and i in self._mixed_ready_tugs:
-                self.route_stage[i] = max(route_len - 1, 0)
+                self._episode.route_stage[i] = max(route_len - 1, 0)
+            elif init_mode == "mixed_slot_approach" and i in self._episode.mixed_ready_tugs:
+                self._episode.route_stage[i] = max(route_len - 1, 0)
             else:
-                self.route_stage[i] = 0
+                self._episode.route_stage[i] = 0
 
+        slot_world = self.ship.slot_positions_world()
         for i, tug in enumerate(self.tugs):
             slot = slot_world[self.tug_to_slot[i]]
-            self.prev_dist[i] = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
-            self.prev_route_remaining[i] = float(self._route._route_remaining_distance(i))
-            self.prev_d_hull[i] = self.ship.distance_from_hull(tug.eta.x, tug.eta.y)
+            self._episode.prev_dist[i] = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
+            self._episode.prev_route_remaining[i] = float(RoutePlanner._route_remaining_distance(
+                self.cfg, ship_snap, self.tugs, self.tug_to_slot, self._episode, i,
+            ))
+            self._episode.prev_d_hull[i] = self.ship.distance_from_hull(tug.eta.x, tug.eta.y)
             spd_err, head_err = self._tug_track_errors(tug, slot)
-            self.prev_speed_err[i] = spd_err
-            self.prev_heading_err[i] = head_err
+            self._episode.prev_speed_err[i] = spd_err
+            self._episode.prev_heading_err[i] = head_err
 
-        return self._obs.build_obs()
+        state = self._build_sim_state()
+        return Observer.build_obs(state, self.motion_history, self.action_history, self.obs_dim)
 
     # -------------------------------------------------------------- step
 
@@ -351,6 +397,7 @@ class FormationEnv:
               info:    dict，含 reward 分量、是否成功、是否碰撞等
         """
         actions = np.clip(actions, -1.0, 1.0).astype(np.float32)
+        actions = self._apply_route_guidance(actions)
         actions = self._apply_route_speed_governor(actions)
         prev_nu = np.asarray(
             [[tug.nu.x, tug.nu.y, tug.nu.z] for tug in self.tugs],
@@ -368,12 +415,17 @@ class FormationEnv:
         self.ship.step(self.cfg.dt_ctrl)
         self.step_count += 1
 
+        ship_snap = _make_ship_snapshot(self.ship)
+
         if self._uses_route_mode():
             for i in range(self.n_tugs):
-                self._route._advance_route_stage(i)
+                RoutePlanner._advance_route_stage(
+                    self.cfg, ship_snap, self.tugs, self.tug_to_slot, self._episode, i,
+                )
 
         slot_world = self.ship.slot_positions_world()
-        rewards, info = self._reward.compute_rewards(actions, slot_world)
+        state = self._build_sim_state()
+        rewards, info = self._reward.compute_rewards(state, self._episode, actions, slot_world)
         self.last_reward_components = info.get("reward_components", {})
 
         dones, term_info = self._check_termination(slot_world)
@@ -381,8 +433,6 @@ class FormationEnv:
 
         terminal_reward = np.zeros(self.n_tugs, dtype=np.float32)
         if term_info.get("collision"):
-            # P1 按责分配：肇事 tug 吃满 culprit 惩罚，其余 bystander 只共担小额。
-            # 消除"全员共担"导致 critic 无法归因碰撞回报的问题。
             pen_culprit = float(
                 getattr(self.cfg, "reward_collision_pen_culprit", self.cfg.reward_collision_pen)
             )
@@ -404,18 +454,55 @@ class FormationEnv:
         info["terminal_reward"] = terminal_reward
 
         self.last_actions = actions.copy()
-        self._obs.append_obs_history(actions, prev_nu)
+        Observer.append_obs_history(self.motion_history, self.action_history, self.tugs, actions, prev_nu)
         for i, tug in enumerate(self.tugs):
             slot = slot_world[self.tug_to_slot[i]]
-            self.prev_dist[i] = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
-            self.prev_route_remaining[i] = float(self._route._route_remaining_distance(i))
-            self.prev_d_hull[i] = self.ship.distance_from_hull(tug.eta.x, tug.eta.y)
+            self._episode.prev_dist[i] = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
+            self._episode.prev_route_remaining[i] = float(RoutePlanner._route_remaining_distance(
+                self.cfg, ship_snap, self.tugs, self.tug_to_slot, self._episode, i,
+            ))
+            self._episode.prev_d_hull[i] = self.ship.distance_from_hull(tug.eta.x, tug.eta.y)
             spd_err, head_err = self._tug_track_errors(tug, slot)
-            self.prev_speed_err[i] = spd_err
-            self.prev_heading_err[i] = head_err
+            self._episode.prev_speed_err[i] = spd_err
+            self._episode.prev_heading_err[i] = head_err
 
-        obs = self._obs.build_obs()
+        obs = Observer.build_obs(state, self.motion_history, self.action_history, self.obs_dim)
         return obs, rewards + terminal_reward, dones, info
+
+    # --------------------------------------------------- SimState builder
+
+    def _build_sim_state(self) -> SimState:
+        """构建当前仿真状态的不可变快照。"""
+        ship_snap = _make_ship_snapshot(self.ship)
+        tug_snaps = tuple(_make_tug_snapshot(t) for t in self.tugs)
+
+        # Route waypoints (read from episode cache, compute if missing)
+        route_body = {}  # type: dict[int, np.ndarray]
+        route_world = {}  # type: dict[int, np.ndarray]
+        for i in range(self.n_tugs):
+            body = RoutePlanner._route_waypoints_body_for_tug(
+                self.cfg, ship_snap, self.tugs, self.tug_to_slot, self._episode, i,
+            )
+            route_body[i] = body
+            world = RoutePlanner._route_waypoints_world_for_tug(
+                self.cfg, ship_snap, self.tugs, self.tug_to_slot, self._episode, i,
+            )
+            route_world[i] = world
+
+        return SimState(
+            cfg=self.cfg,
+            n_tugs=self.n_tugs,
+            dt_ctrl=self.cfg.dt_ctrl,
+            ship=ship_snap,
+            tugs=tug_snaps,
+            slot_positions_world=self.ship.slot_positions_world(),
+            tug_to_slot=self.tug_to_slot.copy(),
+            route_stage=self._episode.route_stage.copy(),
+            route_waypoints_body=route_body,
+            route_waypoints_world=route_world,
+            last_actions=self.last_actions.copy(),
+            init_mode=self._init_mode(),
+        )
 
     def _tug_track_errors(self, tug, slot) -> tuple[float, float]:
         """单艇相对大船的速度误差与航向误差（P3 势函数 shaping 用，单一来源避免公式重复）。"""
@@ -451,8 +538,11 @@ class FormationEnv:
         ship_vy_w = sn * self.ship.u + cs * self.ship.v
 
         for i, tug in enumerate(self.tugs):
-            route_len = len(self._route._route_waypoints_body_for_tug(i))
-            if int(self.route_stage[i]) >= route_len - 1:
+            route_len = len(RoutePlanner._route_waypoints_body_for_tug(
+                self.cfg, _make_ship_snapshot(self.ship), self.tugs,
+                self.tug_to_slot, self._episode, i,
+            ))
+            if int(self._episode.route_stage[i]) >= route_len - 1:
                 continue
 
             ci = math.cos(tug.eta.z)
@@ -473,13 +563,123 @@ class FormationEnv:
 
         return governed
 
+    def _apply_route_guidance(self, actions: np.ndarray) -> np.ndarray:
+        blend = float(getattr(self.cfg, "route_guidance_blend", 0.0))
+        final_blend = float(getattr(self.cfg, "route_guidance_final_blend", 0.0))
+        if blend <= 0.0 and final_blend <= 0.0:
+            return actions
+        if not self._uses_route_mode():
+            return actions
+
+        blend = float(np.clip(blend, 0.0, 1.0))
+        final_blend = float(np.clip(final_blend, 0.0, 1.0))
+        forward_base = float(getattr(self.cfg, "route_guidance_forward_action", 0.28))
+        turn_base = float(getattr(self.cfg, "route_guidance_turn_action", 0.12))
+        dist_scale = max(float(getattr(self.cfg, "route_guidance_distance_scale_m", 120.0)), 1e-6)
+        final_forward_base = float(
+            getattr(self.cfg, "route_guidance_final_forward_action", forward_base)
+        )
+        final_turn_base = float(
+            getattr(self.cfg, "route_guidance_final_turn_action", turn_base)
+        )
+        final_heading_turn_base = float(
+            getattr(self.cfg, "route_guidance_final_heading_turn_action", 0.0)
+        )
+        final_dist_scale = max(
+            float(getattr(self.cfg, "route_guidance_final_distance_scale_m", dist_scale)),
+            1e-6,
+        )
+        allow_reverse = bool(getattr(self.cfg, "route_guidance_allow_reverse", True))
+        guided = actions.copy()
+        ship_snap = _make_ship_snapshot(self.ship)
+        slot_world = self.ship.slot_positions_world() if final_blend > 0.0 else None
+
+        for i, tug in enumerate(self.tugs):
+            route_len = len(RoutePlanner._route_waypoints_body_for_tug(
+                self.cfg, ship_snap, self.tugs, self.tug_to_slot, self._episode, i,
+            ))
+            route_final = int(self._episode.route_stage[i]) >= route_len - 1
+            if route_final and final_blend <= 0.0:
+                continue
+            if not route_final and blend <= 0.0:
+                continue
+
+            active_blend = final_blend if route_final else blend
+            active_forward = final_forward_base if route_final else forward_base
+            active_turn = final_turn_base if route_final else turn_base
+            active_dist_scale = final_dist_scale if route_final else dist_scale
+            if route_final and slot_world is not None:
+                route_target = slot_world[self.tug_to_slot[i]]
+                target_heading = float(route_target[2])
+            else:
+                route_target = RoutePlanner._current_route_target_world(
+                    self.cfg, ship_snap, self.tugs, self.tug_to_slot, self._episode, i,
+                )
+                target_heading = None
+            dx = float(route_target[0]) - float(tug.eta.x)
+            dy = float(route_target[1]) - float(tug.eta.y)
+            dist = math.hypot(dx, dy)
+            if dist <= 1e-6 and not route_final:
+                continue
+
+            rpm_sign = 1.0
+            if dist <= 1e-6:
+                los_angle = 0.0
+                rpm_sign = 0.0
+            else:
+                local_x, local_y = _world_to_local(dx, dy, float(tug.eta.z))
+                los_angle = _wrap_pi(math.atan2(local_y, local_x))
+                if allow_reverse and abs(los_angle) > math.pi / 2.0:
+                    rpm_sign = -1.0
+                    los_angle = _wrap_pi(los_angle - math.copysign(math.pi, los_angle))
+            max_az = math.radians(max(float(tug.azimuth_limit_deg), 1e-6))
+            az_cmd = float(np.clip(los_angle, -max_az, max_az)) / max_az
+            min_dist_gain = 0.0 if route_final else 0.25
+            max_dist_gain = 0.80 if route_final else 1.0
+            dist_gain = float(np.clip(dist / active_dist_scale, min_dist_gain, max_dist_gain))
+            forward_cmd = float(np.clip(active_forward * dist_gain, 0.0, 1.0)) * rpm_sign
+            heading_turn = 0.0
+            if route_final and target_heading is not None and final_heading_turn_base > 0.0:
+                heading_err = _wrap_pi(target_heading - float(tug.eta.z))
+                heading_turn = final_heading_turn_base * float(
+                    np.clip(heading_err / max_az, -1.0, 1.0)
+                )
+            turn_limit = max(active_turn + abs(final_heading_turn_base if route_final else 0.0), 1e-6)
+            turn_cmd = float(
+                np.clip(
+                    active_turn * (los_angle / max_az) + heading_turn,
+                    -turn_limit,
+                    turn_limit,
+                )
+            )
+            port_cmd = float(np.clip(forward_cmd + turn_cmd, -1.0, 1.0))
+            stbd_cmd = float(np.clip(forward_cmd - turn_cmd, -1.0, 1.0))
+            command = np.asarray(
+                (port_cmd, stbd_cmd, az_cmd, az_cmd),
+                dtype=np.float32,
+            )
+            guided[i] = (1.0 - active_blend) * guided[i] + active_blend * command
+
+        return np.clip(guided, -1.0, 1.0).astype(np.float32)
+
     # ----------------------------------------------------- observation / state
 
     def _build_obs(self) -> np.ndarray:
-        return self._obs.build_obs()
+        state = self._build_sim_state()
+        return Observer.build_obs(state, self.motion_history, self.action_history, self.obs_dim)
 
     def get_global_state(self) -> np.ndarray:
-        return self._obs.get_global_state()
+        state = self._build_sim_state()
+        return Observer.get_global_state(state, self._episode.in_zone_steps)
+
+    def _compute_rewards(
+        self, actions: np.ndarray, slot_world: np.ndarray | None = None
+    ) -> tuple[np.ndarray, dict]:
+        """Convenience wrapper that builds SimState and delegates to reward computer."""
+        if slot_world is None:
+            slot_world = self.ship.slot_positions_world()
+        state = self._build_sim_state()
+        return self._reward.compute_rewards(state, self._episode, actions, slot_world)
 
     # -------------------------------------------------------- termination
 
@@ -567,10 +767,16 @@ class FormationEnv:
                 "ctrl": ctrl,
                 "thruster": thr,
                 "slot_idx": int(self.tug_to_slot[i]),
-                "route_stage": int(self.route_stage[i]),
-                "route_remaining": float(self._route._route_remaining_distance(i)),
-                "route_target": self._route._current_route_target_world(i).copy(),
-                "in_zone_steps": int(self.in_zone_steps[i]),
+                "route_stage": int(self._episode.route_stage[i]),
+                "route_remaining": float(RoutePlanner._route_remaining_distance(
+                    self.cfg, _make_ship_snapshot(self.ship), self.tugs,
+                    self.tug_to_slot, self._episode, i,
+                )),
+                "route_target": RoutePlanner._current_route_target_world(
+                    self.cfg, _make_ship_snapshot(self.ship), self.tugs,
+                    self.tug_to_slot, self._episode, i,
+                ).copy(),
+                "in_zone_steps": int(self._episode.in_zone_steps[i]),
                 "r_target": float(self.last_reward_components.get("r_target", np.zeros(self.n_tugs))[i]),
                 "r_velocity": float(self.last_reward_components.get("r_velocity", np.zeros(self.n_tugs))[i]),
                 "dist_to_slot": float(self.last_reward_components.get("dist_to_slot", np.zeros(self.n_tugs))[i]),

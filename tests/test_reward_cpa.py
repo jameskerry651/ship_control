@@ -16,7 +16,7 @@ def _make_env() -> FormationEnv:
 
 def _compute_reward_components(env: FormationEnv) -> dict:
     actions = np.zeros((env.cfg.n_tugs, 4), dtype=np.float32)
-    _, info = env._reward.compute_rewards(actions, env.ship.slot_positions_world())
+    _, info = env._compute_rewards(actions)
     return info["reward_components"]
 
 

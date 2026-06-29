@@ -2,26 +2,30 @@
 
 在船体坐标上进行A*网格搜索、直线可达(LOS)简化、B样条平滑，
 以及航点推进跟踪。
+
+子模块不持有 ``FormationEnv`` 引用，状态通过 ``SimState`` 和 ``MutableEpisodeState`` 传入。
 """
 
 from __future__ import annotations
 
 import heapq
 import math
-from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.interpolate import splprep, splev
 
-if TYPE_CHECKING:
-    from env.formation_env import FormationEnv
+from config import EnvConfig
+from env.state import MutableEpisodeState, ShipSnapshot, TugSnapshot
 
 
 class RoutePlanner:
-    """Route planner that owns all path-finding and waypoint-tracking logic."""
+    """Route planner that owns all path-finding and waypoint-tracking logic.
 
-    def __init__(self, env: FormationEnv) -> None:
-        self._env = env
+    无状态设计：不持有 ``FormationEnv`` 引用，cfg / ship / tugs 通过参数传入。
+    """
+
+    def __init__(self) -> None:
+        pass
 
     # ------------------------------------------------------------------ helpers
 
@@ -69,22 +73,22 @@ class RoutePlanner:
                 t1 = min(t1, r)
         return t1 >= t0 and t1 > eps and t0 < 1.0 - eps
 
+    @staticmethod
     def _body_segment_visible(
-        self,
         p0: tuple[float, float],
         p1: tuple[float, float],
         rect: tuple[float, float, float, float],
     ) -> bool:
-        if self._point_in_rect_interior(p0, rect) or self._point_in_rect_interior(p1, rect):
+        if RoutePlanner._point_in_rect_interior(p0, rect) or RoutePlanner._point_in_rect_interior(p1, rect):
             return False
         x_min, x_max, y_min, y_max = rect
         shrunk = (x_min + 1e-6, x_max - 1e-6, y_min + 1e-6, y_max - 1e-6)
         if shrunk[0] >= shrunk[1] or shrunk[2] >= shrunk[3]:
             return True
-        return not self._segment_intersects_closed_rect(p0, p1, shrunk)
+        return not RoutePlanner._segment_intersects_closed_rect(p0, p1, shrunk)
 
+    @staticmethod
     def _simplify_path_los(
-        self,
         points: list[tuple[float, float]],
         rect: tuple[float, float, float, float],
     ) -> list[tuple[float, float]]:
@@ -94,7 +98,7 @@ class RoutePlanner:
         i = 0
         while i < len(points) - 1:
             j = len(points) - 1
-            while j > i + 1 and not self._body_segment_visible(points[i], points[j], rect):
+            while j > i + 1 and not RoutePlanner._body_segment_visible(points[i], points[j], rect):
                 j -= 1
             out.append(points[j])
             i = j
@@ -102,30 +106,33 @@ class RoutePlanner:
 
     # --------------------------------------------------------------- slot utils
 
-    def _slot_side_sign(self, slot_idx: int) -> float:
+    @staticmethod
+    def _slot_side_sign(slot_idx: int) -> float:
         return -1.0 if int(slot_idx) in (0, 2) else 1.0
 
     @staticmethod
     def _slot_is_bow(slot_idx: int) -> bool:
         return int(slot_idx) in (0, 1)
 
-    def _slot_lane_lat_abs(self, slot_idx: int) -> float:
-        cfg = self._env.cfg
-        if self._slot_is_bow(slot_idx):
+    @staticmethod
+    def _slot_lane_lat_abs(cfg: EnvConfig, slot_idx: int) -> float:
+        if RoutePlanner._slot_is_bow(slot_idx):
             return float(getattr(cfg, "route_bow_lane_lat_m", 90.0))
         return float(getattr(cfg, "route_stern_lane_lat_m", 55.0))
 
     # --------------------------------------------------------------- hull geom
 
-    def _hull_rect_body(self) -> tuple[float, float, float, float]:
-        l_half = self._env.ship.length_m / 2.0
-        b_half = self._env.ship.beam_m / 2.0
+    @staticmethod
+    def _hull_rect_body(ship: ShipSnapshot) -> tuple[float, float, float, float]:
+        l_half = ship.length_m / 2.0
+        b_half = ship.beam_m / 2.0
         return (-l_half, l_half, -b_half, b_half)
 
     # --------------------------------------------------------------- A*
 
+    @staticmethod
     def _astar_path_body(
-        self,
+        cfg: EnvConfig,
         start: tuple[float, float],
         goal: tuple[float, float],
         rect: tuple[float, float, float, float],
@@ -133,10 +140,8 @@ class RoutePlanner:
         *,
         allow_los_shortcut: bool = True,
     ) -> list[tuple[float, float]]:
-        if allow_los_shortcut and self._body_segment_visible(start, goal, rect):
+        if allow_los_shortcut and RoutePlanner._body_segment_visible(start, goal, rect):
             return [start, goal]
-
-        cfg = self._env.cfg
         margin = float(
             getattr(
                 cfg,
@@ -165,7 +170,7 @@ class RoutePlanner:
             return x_lo + ix * cell, y_lo + iy * cell
 
         def blocked(ix: int, iy: int) -> bool:
-            return self._point_in_rect_interior(to_xy(ix, iy), rect)
+            return RoutePlanner._point_in_rect_interior(to_xy(ix, iy), rect)
 
         start_idx = to_idx(start[0], start[1])
         goal_idx = to_idx(goal[0], goal[1])
@@ -247,7 +252,7 @@ class RoutePlanner:
             return [start, goal]
 
         path_xy = [to_xy(ix, iy) for ix, iy in path_idx]
-        simplified = self._simplify_path_los(path_xy, rect)
+        simplified = RoutePlanner._simplify_path_los(path_xy, rect)
         if not simplified:
             return [start, goal]
         simplified[0] = start
@@ -256,10 +261,11 @@ class RoutePlanner:
 
     # ----------------------------------------------------- waypoint processing
 
-    def _dedupe_route_points(self, points: list[tuple[float, float]]) -> np.ndarray:
+    @staticmethod
+    def _dedupe_route_points(cfg: EnvConfig, points: list[tuple[float, float]]) -> np.ndarray:
         if not points:
             return np.zeros((0, 2), dtype=np.float64)
-        min_spacing = float(getattr(self._env.cfg, "route_min_waypoint_spacing_m", 2.0))
+        min_spacing = float(getattr(cfg, "route_min_waypoint_spacing_m", 2.0))
         out: list[tuple[float, float]] = [points[0]]
         for point in points[1:-1]:
             if math.hypot(point[0] - out[-1][0], point[1] - out[-1][1]) >= min_spacing:
@@ -323,8 +329,8 @@ class RoutePlanner:
 
     # ----------------------------------------------------- route construction
 
-    def _route_at_slot_skip_tol_m(self) -> float:
-        cfg = self._env.cfg
+    @staticmethod
+    def _route_at_slot_skip_tol_m(cfg: EnvConfig) -> float:
         return float(
             getattr(
                 cfg,
@@ -333,40 +339,42 @@ class RoutePlanner:
             )
         )
 
+    @staticmethod
     def _route_body_distance(
-        self,
         a: tuple[float, float],
         b: tuple[float, float],
     ) -> float:
         return float(math.hypot(a[0] - b[0], a[1] - b[1]))
 
+    @staticmethod
     def _route_already_at_slot(
-        self,
+        cfg: EnvConfig,
         start: tuple[float, float],
         goal: tuple[float, float],
     ) -> bool:
-        return self._route_body_distance(start, goal) <= self._route_at_slot_skip_tol_m()
+        return RoutePlanner._route_body_distance(start, goal) <= RoutePlanner._route_at_slot_skip_tol_m(cfg)
 
+    @staticmethod
     def _plan_route_segments_body(
-        self,
+        cfg: EnvConfig,
+        ship: ShipSnapshot,
         start: tuple[float, float],
         goal: tuple[float, float],
         slot_idx: int,
     ) -> list[tuple[float, float]]:
-        if self._route_already_at_slot(start, goal):
+        if RoutePlanner._route_already_at_slot(cfg, start, goal):
             return [start, goal]
 
-        cfg = self._env.cfg
-        side = self._slot_side_sign(slot_idx)
-        rect = self._hull_rect_body()
-        l_half = self._env.ship.length_m / 2.0
-        lane_y = side * self._slot_lane_lat_abs(slot_idx)
+        side = RoutePlanner._slot_side_sign(slot_idx)
+        rect = RoutePlanner._hull_rect_body(ship)
+        l_half = ship.length_m / 2.0
+        lane_y = side * RoutePlanner._slot_lane_lat_abs(cfg, slot_idx)
         stern_back = float(getattr(cfg, "route_stern_gate_dist_m", 60.0))
 
         anchors: list[tuple[float, float]] = [start]
         if start[0] < -l_half - 25.0:
             anchors.append((-l_half - stern_back, lane_y))
-        if self._slot_is_bow(slot_idx) and start[0] < l_half * 0.5:
+        if RoutePlanner._slot_is_bow(slot_idx) and start[0] < l_half * 0.5:
             anchors.append((0.0, lane_y))
             anchors.append(
                 (l_half + max(20.0, float(getattr(cfg, "route_astar_margin_m", 10.0))), lane_y)
@@ -384,8 +392,8 @@ class RoutePlanner:
 
         planned: list[tuple[float, float]] = []
         for seg_start, seg_goal in zip(unique[:-1], unique[1:]):
-            segment = self._astar_path_body(
-                seg_start, seg_goal, rect, side, allow_los_shortcut=False
+            segment = RoutePlanner._astar_path_body(
+                cfg, seg_start, seg_goal, rect, side, allow_los_shortcut=False,
             )
             if not planned:
                 planned.extend(segment)
@@ -393,44 +401,51 @@ class RoutePlanner:
                 planned.extend(segment[1:])
         return planned
 
-    def _route_waypoints_body_for_tug(self, tug_idx: int) -> np.ndarray:
-        cached = self._env._route_waypoints_body_cache.get(tug_idx)
+    @staticmethod
+    def _route_waypoints_body_for_tug(
+        cfg: EnvConfig,
+        ship: ShipSnapshot,
+        tugs: list,
+        tug_to_slot: np.ndarray,
+        episode: MutableEpisodeState,
+        tug_idx: int,
+    ) -> np.ndarray:
+        cached = episode.route_waypoints_body_cache.get(tug_idx)
         if cached is not None:
             return cached
 
-        cfg = self._env.cfg
-        tug = self._env.tugs[tug_idx]
-        start_xy = self._env._ship_body_xy(tug.eta.x, tug.eta.y)
+        tug = tugs[tug_idx]
+        start_xy = ship.world_to_body(tug.eta.x, tug.eta.y)
         start = (float(start_xy[0]), float(start_xy[1]))
-        slot_idx = int(self._env.tug_to_slot[tug_idx])
-        slot_arr = self._env.ship.slot_positions_body()[slot_idx, :2]
+        slot_idx = int(tug_to_slot[tug_idx])
+        slot_arr = ship.slot_positions_body()[slot_idx, :2]
         goal = (float(slot_arr[0]), float(slot_arr[1]))
 
-        at_slot = self._route_already_at_slot(start, goal)
+        at_slot = RoutePlanner._route_already_at_slot(cfg, start, goal)
         if at_slot:
             planned: list[tuple[float, float]] = [start, goal]
         else:
-            planned = self._plan_route_segments_body(start, goal, slot_idx)
+            planned = RoutePlanner._plan_route_segments_body(cfg, ship, start, goal, slot_idx)
 
         points = np.asarray(planned, dtype=np.float64)
         if len(points) < 2:
             points = np.array([start, goal], dtype=np.float64)
 
-        path_len = self._route_body_distance(start, goal)
+        path_len = RoutePlanner._route_body_distance(start, goal)
         use_smooth = (
             not at_slot
-            and path_len > self._route_at_slot_skip_tol_m()
+            and path_len > RoutePlanner._route_at_slot_skip_tol_m(cfg)
             and len(points) >= 4
             and bool(getattr(cfg, "route_spline_smooth", True))
         )
         if use_smooth:
-            smoothed = self._smooth_waypoints(points)
-            result = self._dedupe_route_points(
-                [(float(p[0]), float(p[1])) for p in smoothed]
+            smoothed = RoutePlanner._smooth_waypoints(points)
+            result = RoutePlanner._dedupe_route_points(
+                cfg, [(float(p[0]), float(p[1])) for p in smoothed]
             )
         else:
-            result = self._dedupe_route_points(
-                [(float(p[0]), float(p[1])) for p in points]
+            result = RoutePlanner._dedupe_route_points(
+                cfg, [(float(p[0]), float(p[1])) for p in points]
             )
 
         if len(result) < 2:
@@ -442,40 +457,80 @@ class RoutePlanner:
 
         num_fixed = int(getattr(cfg, "route_num_waypoints", 0))
         if num_fixed >= 2:
-            result = self._resample_route_fixed_count(result, num_fixed, start, goal)
+            result = RoutePlanner._resample_route_fixed_count(result, num_fixed, start, goal)
 
-        self._env._route_waypoints_body_cache[tug_idx] = result
+        episode.route_waypoints_body_cache[tug_idx] = result
         return result
 
-    def _route_waypoints_world_for_tug(self, tug_idx: int) -> np.ndarray:
-        points_body = self._route_waypoints_body_for_tug(tug_idx)
+    @staticmethod
+    def _route_waypoints_world_for_tug(
+        cfg: EnvConfig,
+        ship: ShipSnapshot,
+        tugs: list,
+        tug_to_slot: np.ndarray,
+        episode: MutableEpisodeState,
+        tug_idx: int,
+    ) -> np.ndarray:
+        points_body = RoutePlanner._route_waypoints_body_for_tug(
+            cfg, ship, tugs, tug_to_slot, episode, tug_idx,
+        )
         points_world = np.zeros_like(points_body)
         for k, (x_b, y_b) in enumerate(points_body):
-            points_world[k] = self._env._ship_body_to_world_xy(float(x_b), float(y_b))
+            points_world[k] = ship.body_to_world(float(x_b), float(y_b))
         return points_world
 
     # --------------------------------------------------- route-state tracking
 
-    def _advance_route_stage(self, tug_idx: int) -> None:
-        waypoints = self._route_waypoints_world_for_tug(tug_idx)
-        tol = float(getattr(self._env.cfg, "route_waypoint_tol_m", 35.0))
-        tug = self._env.tugs[tug_idx]
-        while int(self._env.route_stage[tug_idx]) < len(waypoints) - 1:
-            target = waypoints[int(self._env.route_stage[tug_idx])]
+    @staticmethod
+    def _advance_route_stage(
+        cfg: EnvConfig,
+        ship: ShipSnapshot,
+        tugs: list,
+        tug_to_slot: np.ndarray,
+        episode: MutableEpisodeState,
+        tug_idx: int,
+    ) -> None:
+        waypoints = RoutePlanner._route_waypoints_world_for_tug(
+            cfg, ship, tugs, tug_to_slot, episode, tug_idx,
+        )
+        tol = float(getattr(cfg, "route_waypoint_tol_m", 35.0))
+        tug = tugs[tug_idx]
+        while int(episode.route_stage[tug_idx]) < len(waypoints) - 1:
+            target = waypoints[int(episode.route_stage[tug_idx])]
             if math.hypot(tug.eta.x - target[0], tug.eta.y - target[1]) > tol:
                 break
-            self._env.route_stage[tug_idx] += 1
+            episode.route_stage[tug_idx] += 1
 
-    def _route_remaining_distance(self, tug_idx: int) -> float:
-        waypoints = self._route_waypoints_world_for_tug(tug_idx)
-        stage = int(np.clip(self._env.route_stage[tug_idx], 0, len(waypoints) - 1))
-        tug = self._env.tugs[tug_idx]
+    @staticmethod
+    def _route_remaining_distance(
+        cfg: EnvConfig,
+        ship: ShipSnapshot,
+        tugs: list,
+        tug_to_slot: np.ndarray,
+        episode: MutableEpisodeState,
+        tug_idx: int,
+    ) -> float:
+        waypoints = RoutePlanner._route_waypoints_world_for_tug(
+            cfg, ship, tugs, tug_to_slot, episode, tug_idx,
+        )
+        stage = int(np.clip(episode.route_stage[tug_idx], 0, len(waypoints) - 1))
+        tug = tugs[tug_idx]
         rem = math.hypot(tug.eta.x - waypoints[stage, 0], tug.eta.y - waypoints[stage, 1])
         for k in range(stage, len(waypoints) - 1):
             rem += float(np.linalg.norm(waypoints[k + 1] - waypoints[k]))
         return float(rem)
 
-    def _current_route_target_world(self, tug_idx: int) -> np.ndarray:
-        waypoints = self._route_waypoints_world_for_tug(tug_idx)
-        stage = int(np.clip(self._env.route_stage[tug_idx], 0, len(waypoints) - 1))
+    @staticmethod
+    def _current_route_target_world(
+        cfg: EnvConfig,
+        ship: ShipSnapshot,
+        tugs: list,
+        tug_to_slot: np.ndarray,
+        episode: MutableEpisodeState,
+        tug_idx: int,
+    ) -> np.ndarray:
+        waypoints = RoutePlanner._route_waypoints_world_for_tug(
+            cfg, ship, tugs, tug_to_slot, episode, tug_idx,
+        )
+        stage = int(np.clip(episode.route_stage[tug_idx], 0, len(waypoints) - 1))
         return waypoints[stage]

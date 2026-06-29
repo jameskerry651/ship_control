@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -28,14 +29,12 @@ from rl.ppo import MAPPOActorCritic
 from scripts.train import _load_checkpoint, evaluate_policy
 
 
-STAGES = (
-    ("c01", "curricula/c01_three_ready.py", "c01_three_ready"),
-    ("c02", "curricula/c02_two_ready.py", "c02_two_ready"),
-    ("c03", "curricula/c03_one_ready.py", "c03_one_ready"),
-    ("c04", "curricula/c04_zero_ready.py", "c04_zero_ready"),
-)
+from curricula.registry import MAIN_SEQUENCE
 
-STAGE_INDEX = {key: idx for idx, (key, _, _) in enumerate(STAGES)}
+STAGES = tuple(
+    (entry.key, entry.project_relative_path, entry.run_name) for entry in MAIN_SEQUENCE
+)
+STAGE_INDEX = {entry.key: idx for idx, entry in enumerate(MAIN_SEQUENCE)}
 
 
 def _env_with_project_pythonpath() -> dict[str, str]:
@@ -55,6 +54,26 @@ def _checkpoint_path(run_name: str) -> Path:
 
 def _stage_threshold(args: argparse.Namespace, key: str) -> float:
     return float(getattr(args, f"stage_threshold_{key}"))
+
+
+def _stage_max_collision(args: argparse.Namespace, key: str) -> float:
+    return float(getattr(args, f"max_stage_collision_{key}"))
+
+
+def _stage_learning_rate(args: argparse.Namespace, resume: Path | None) -> float:
+    return (
+        float(args.learning_rate_transfer)
+        if resume is not None
+        else float(args.learning_rate_initial)
+    )
+
+
+def _stage_success_bc_coef(args: argparse.Namespace, resume: Path | None) -> float:
+    return (
+        float(args.success_bc_coef_transfer)
+        if resume is not None
+        else float(args.success_bc_coef_initial)
+    )
 
 
 def _run_stage(
@@ -85,6 +104,14 @@ def _run_stage(
         str(args.eval_workers),
         "--env-backend",
         args.env_backend,
+        "--learning-rate",
+        str(_stage_learning_rate(args, resume)),
+        "--entropy-coef",
+        str(args.entropy_coef),
+        "--target-kl",
+        str(args.target_kl),
+        "--success-bc-coef",
+        str(_stage_success_bc_coef(args, resume)),
     ]
     if args.env_workers is not None:
         cmd.extend(["--env-workers", str(args.env_workers)])
@@ -103,6 +130,8 @@ def _run_stage(
                 str(args.critic_warmup_updates),
             ]
         )
+        if args.set_log_std_transfer is not None:
+            cmd.extend(["--set-log-std", str(args.set_log_std_transfer)])
 
     print("\n[run]", " ".join(cmd), flush=True)
     if args.dry_run:
@@ -141,12 +170,20 @@ def _run_c04_refine(args: argparse.Namespace, *, resume: Path, attempt: int) -> 
         str(args.total_steps_c04_refine),
         "--learning-rate",
         str(args.learning_rate_c04_refine),
+        "--entropy-coef",
+        str(args.entropy_coef),
+        "--target-kl",
+        str(args.target_kl),
+        "--success-bc-coef",
+        str(args.success_bc_coef_transfer),
         "--resume",
         str(resume),
         "--reset-progress",
         "--critic-warmup-updates",
         str(args.critic_warmup_updates_c04_refine),
     ]
+    if args.set_log_std_transfer is not None:
+        cmd.extend(["--set-log-std", str(args.set_log_std_transfer)])
     if args.env_workers is not None:
         cmd.extend(["--env-workers", str(args.env_workers)])
 
@@ -212,6 +249,10 @@ def _evaluate_final(
     )
 
 
+def _canonical_final_checkpoint(args: argparse.Namespace) -> Path:
+    return _checkpoint_path(f"{args.run_prefix}_c04_zero_ready_refine")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train c01->c04 curriculum and verify c04 success rate."
@@ -227,6 +268,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-backend", choices=("subproc", "sync"), default="subproc")
     parser.add_argument("--env-workers", type=int, default=None)
     parser.add_argument("--critic-warmup-updates", type=int, default=5)
+    parser.add_argument("--learning-rate-initial", type=float, default=1e-4)
+    parser.add_argument("--learning-rate-transfer", type=float, default=5e-5)
+    parser.add_argument("--entropy-coef", type=float, default=0.0)
+    parser.add_argument("--target-kl", type=float, default=0.01)
+    parser.add_argument("--set-log-std-transfer", type=float, default=-1.0)
+    parser.add_argument("--success-bc-coef-initial", type=float, default=0.0)
+    parser.add_argument("--success-bc-coef-transfer", type=float, default=0.10)
     parser.add_argument("--eval-episodes", type=int, default=64)
     parser.add_argument("--target-success", type=float, default=0.80)
     parser.add_argument(
@@ -256,7 +304,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-threshold-c01", type=float, default=0.60)
     parser.add_argument("--stage-threshold-c02", type=float, default=0.60)
     parser.add_argument("--stage-threshold-c03", type=float, default=0.50)
+    parser.add_argument("--stage-threshold-c04a", type=float, default=0.70)
+    parser.add_argument("--stage-threshold-c04b", type=float, default=0.70)
     parser.add_argument("--stage-threshold-c04", type=float, default=0.80)
+    parser.add_argument("--max-stage-collision-c01", type=float, default=0.12)
+    parser.add_argument("--max-stage-collision-c02", type=float, default=0.12)
+    parser.add_argument("--max-stage-collision-c03", type=float, default=0.12)
+    parser.add_argument("--max-stage-collision-c04a", type=float, default=0.10)
+    parser.add_argument("--max-stage-collision-c04b", type=float, default=0.10)
+    parser.add_argument("--max-stage-collision-c04", type=float, default=0.10)
+    parser.add_argument("--max-final-collision", type=float, default=0.08)
     parser.add_argument(
         "--no-c04-refine",
         action="store_true",
@@ -275,6 +332,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-steps-c01", type=int, default=None)
     parser.add_argument("--total-steps-c02", type=int, default=None)
     parser.add_argument("--total-steps-c03", type=int, default=None)
+    parser.add_argument("--total-steps-c04a", type=int, default=None)
+    parser.add_argument("--total-steps-c04b", type=int, default=None)
     parser.add_argument("--total-steps-c04", type=int, default=None)
     return parser.parse_args()
 
@@ -285,9 +344,12 @@ def main() -> int:
     final_ckpt: Path | None = None
 
     for key, course_path, label in STAGES[STAGE_INDEX[args.start_stage]:]:
+        stage_input = previous
         stage_passed = False
         best_stage_ckpt: Path | None = None
         best_stage_success = -1.0
+        best_stage_collision = 1.0
+        best_stage_score = -float("inf")
         for attempt in range(1, max(1, int(args.stage_attempts)) + 1):
             run_name = f"{args.run_prefix}_{label}" if attempt == 1 else f"{args.run_prefix}_{label}_a{attempt}"
             final_ckpt = _run_stage(
@@ -295,7 +357,7 @@ def main() -> int:
                 key=key,
                 course_path=course_path,
                 run_name=run_name,
-                resume=previous,
+                resume=stage_input,
             )
             if key == "c04" and not args.no_c04_refine:
                 final_ckpt = _run_c04_refine(args, resume=final_ckpt, attempt=attempt)
@@ -312,25 +374,47 @@ def main() -> int:
                 eval_workers=args.eval_workers,
             )
             success_rate = stats["eval/success_rate"]
+            collision_rate = stats["eval/collision_rate"]
             print(f"\n[stage-eval] {key} attempt={attempt}")
             for stat_key, value in stats.items():
                 print(f"{stat_key}: {value:.6f}")
-            if success_rate > best_stage_success:
+            stage_score = success_rate - 0.5 * collision_rate
+            if stage_score > best_stage_score:
+                best_stage_score = stage_score
                 best_stage_success = success_rate
+                best_stage_collision = collision_rate
                 best_stage_ckpt = final_ckpt
             threshold = _stage_threshold(args, key)
-            if args.no_stage_gates or success_rate >= threshold:
-                print(f"[stage-pass] {key}: {success_rate:.4f} >= {threshold:.4f}")
+            max_collision = _stage_max_collision(args, key)
+            if args.no_stage_gates:
+                print(
+                    f"[stage-continue] {key}: "
+                    f"success={success_rate:.4f}, threshold={threshold:.4f}, "
+                    f"collision={collision_rate:.4f}, max_collision={max_collision:.4f}"
+                )
                 previous = final_ckpt
                 stage_passed = True
                 break
-            print(f"[stage-retry] {key}: {success_rate:.4f} < {threshold:.4f}")
-            previous = final_ckpt
+            success_ok = success_rate >= threshold
+            collision_ok = collision_rate <= max_collision
+            if success_ok and collision_ok:
+                print(
+                    f"[stage-pass] {key}: success={success_rate:.4f} >= {threshold:.4f}, "
+                    f"collision={collision_rate:.4f} <= {max_collision:.4f}"
+                )
+                previous = final_ckpt
+                stage_passed = True
+                break
+            print(
+                f"[stage-retry] {key}: success={success_rate:.4f}/{threshold:.4f}, "
+                f"collision={collision_rate:.4f}/{max_collision:.4f}"
+            )
 
         if not stage_passed:
             assert best_stage_ckpt is not None
             print(
                 f"[stage-fail] {key}: best_success={best_stage_success:.4f}, "
+                f"best_collision={best_stage_collision:.4f}, "
                 f"best_ckpt={best_stage_ckpt}",
                 file=sys.stderr,
             )
@@ -352,13 +436,23 @@ def main() -> int:
         print(f"{key}: {value:.6f}")
 
     success_rate = stats["eval/success_rate"]
-    if success_rate < args.target_success:
+    collision_rate = stats["eval/collision_rate"]
+    if success_rate < args.target_success or collision_rate > args.max_final_collision:
         print(
-            f"[fail] success_rate={success_rate:.4f} < target={args.target_success:.4f}",
+            f"[fail] success_rate={success_rate:.4f}/{args.target_success:.4f}, "
+            f"collision_rate={collision_rate:.4f}/{args.max_final_collision:.4f}",
             file=sys.stderr,
         )
         return 2
-    print(f"[pass] success_rate={success_rate:.4f} >= target={args.target_success:.4f}")
+    print(
+        f"[pass] success_rate={success_rate:.4f} >= target={args.target_success:.4f}, "
+        f"collision_rate={collision_rate:.4f} <= max={args.max_final_collision:.4f}"
+    )
+    canonical_ckpt = _canonical_final_checkpoint(args)
+    if final_ckpt.resolve() != canonical_ckpt.resolve():
+        canonical_ckpt.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(final_ckpt, canonical_ckpt)
+        print(f"[artifact] canonical final checkpoint: {canonical_ckpt}")
     print(f"[artifact] final checkpoint: {final_ckpt}")
     return 0
 
