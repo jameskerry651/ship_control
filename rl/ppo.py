@@ -9,12 +9,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from rl.actor import MAPPOActor
+from env.obs_spec import ObservationSpec
+from rl.actor import build_actor
 from rl.critic import MAPPOCritic
 
 
@@ -26,7 +28,22 @@ class MAPPOActorCritic(nn.Module):
     给出，量都在大船船体系下表达），并输出每个 agent 的 V_i(s)。
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, n_agents: int, global_state_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        n_agents: int,
+        global_state_dim: int | None = None,
+        *,
+        actor_arch: str = "mlp",
+        hist_len: int | None = None,
+        observation_spec: ObservationSpec | Mapping[str, Any] | None = None,
+        tf_d_model: int = 64,
+        tf_nhead: int = 4,
+        tf_num_layers: int = 2,
+        tf_ffn_dim: int = 128,
+        tf_dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         if global_state_dim is None:
             raise ValueError("global_state_dim is required for MAPPO critic")
@@ -35,9 +52,33 @@ class MAPPOActorCritic(nn.Module):
         self.action_dim = action_dim
         self.n_agents = n_agents
         self.global_state_dim = int(global_state_dim)
+        self.actor_arch = str(actor_arch).strip().lower()
+        self.tf_d_model = int(tf_d_model)
+        self.tf_nhead = int(tf_nhead)
+        self.tf_num_layers = int(tf_num_layers)
+        self.tf_ffn_dim = int(tf_ffn_dim)
+        self.tf_dropout = float(tf_dropout)
 
-        self.actor = MAPPOActor(obs_dim=obs_dim,action_dim=action_dim,)
-        self.critic = MAPPOCritic(global_state_dim=self.global_state_dim,n_agents=n_agents,)
+        actor_kwargs: dict = {
+            "tf_d_model": self.tf_d_model,
+            "tf_nhead": self.tf_nhead,
+            "tf_num_layers": self.tf_num_layers,
+            "tf_ffn_dim": self.tf_ffn_dim,
+            "tf_dropout": self.tf_dropout,
+        }
+        if hist_len is not None:
+            actor_kwargs["hist_len"] = int(hist_len)
+
+        self.actor = build_actor(
+            self.actor_arch,
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            observation_spec=observation_spec,
+            **actor_kwargs,
+        )
+        self.observation_spec = self.actor.observation_spec
+        self.hist_len = self.observation_spec.history_len
+        self.critic = MAPPOCritic(global_state_dim=self.global_state_dim, n_agents=n_agents)
 
     @property
     def log_std(self) -> torch.Tensor:

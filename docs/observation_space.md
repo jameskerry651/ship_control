@@ -1,8 +1,10 @@
 # 拖轮编队控制观测状态空间
 
-> 实现位置：`env/formation_env.py` 的 `_build_obs()` 与 `get_global_state()`  
-> Actor 网络：`rl/actor.py` 的 `MAPPOActor`  
-> 当前默认配置：`obs_history_k = 3`，`obs_ship_preview_times_s = (5.0, 10.0, 15.0)`
+> 维度契约：`env/obs_spec.py` → `ObservationSpec`（默认 schema v2，**93** 维 / agent）  
+> 构造实现：`env/observer.py` → `Observer.build_obs` / `get_global_state`  
+> Actor：`rl/actor.py`（`MAPPOActor` / `TransformerMAPPOActor`）  
+> 默认配置：`obs_history_k = 3`（4 帧），`obs_ship_preview_times_s = (5.0, 10.0, 15.0)`  
+> 说明：无外部航路观测；旧 schema v1 为 89 维（无 4 维实际推进器反馈）
 
 ## 1. 坐标与符号约定
 
@@ -39,8 +41,8 @@ $$
 | 40-44 | 5 | 大船相对状态 |
 | 45-50 | 6 | 大船轨迹前瞻 |
 | 51-55 | 5 | 本 agent 目标 slot |
-| 56-59 | 4 | 当前 route 目标与进度 |
-| 60-62 | 3 | 最近船体边界向量与距离 |
+| 56-58 | 3 | 最近船体边界向量与距离 |
+| 59-62 | 4 | 当前实际推进器状态 |
 | 63-92 | 30 | 邻居 attention 输入（碰撞风险特征） |
 
 Actor 内部切片为：
@@ -286,41 +288,7 @@ $$
 
 这 5 维是共享 actor 区分不同 agent 目标的关键输入。
 
-## 8. 当前 route 目标与进度，4 维
-
-环境为每艘拖轮维护一条从初始位置到目标 slot 的 route。actor 观测当前 route stage 对应的 waypoint，而不只看最终 slot。
-
-当前 route 目标点相对拖轮的位移投影到拖轮自身坐标系：
-
-$$
-\begin{bmatrix}
-\Delta x_{\mathrm{route},i}^{\mathrm{ego}} \\
-\Delta y_{\mathrm{route},i}^{\mathrm{ego}}
-\end{bmatrix}
-=
-R(-\psi_i)
-\begin{bmatrix}
-x_{\mathrm{route},i} - x_i \\
-y_{\mathrm{route},i} - y_i
-\end{bmatrix}.
-$$
-
-route 块为：
-
-$$
-o_{i,56:60}
-=
-\left[
-\frac{\Delta x_{\mathrm{route},i}^{\mathrm{ego}}}{100},
-\frac{\Delta y_{\mathrm{route},i}^{\mathrm{ego}}}{100},
-\frac{\mathrm{stage}_i}{N_{\mathrm{route},i}-1},
-\frac{D_{\mathrm{remaining},i}}{500}
-\right].
-$$
-
-其中 stage 归一化项会裁剪到 `[0, 1]`。
-
-## 9. 最近船体边界向量与距离，3 维
+## 8. 最近船体边界向量与距离，3 维
 
 为了让 actor 直接感知船体安全边界，环境计算拖轮到大船矩形碰撞 hull 的最近点。最近点先在大船船体系中计算，再转回世界系并投影到拖轮自身坐标系：
 
@@ -340,7 +308,7 @@ $$
 hull 块为：
 
 $$
-o_{i,60:63}
+o_{i,56:59}
 =
 \left[
 \frac{\Delta x_{\mathrm{hull},i}^{\mathrm{ego}}}{50},
@@ -350,6 +318,23 @@ o_{i,60:63}
 $$
 
 其中 `d_hull` 与碰撞检测使用的 hull 距离定义一致。
+
+## 9. 当前实际推进器状态，4 维
+
+策略输出的是推进器命令，但执行器受 RPM 与方位角速率限制，因此命令不等于当前真实状态。Actor 使用如下归一化反馈：
+
+$$
+o_{i,59:63}
+=
+\left[
+\frac{n_{L,i}^{\mathrm{actual}}}{n_i^{\mathrm{limit}}},
+\frac{n_{R,i}^{\mathrm{actual}}}{n_i^{\mathrm{limit}}},
+\frac{\delta_{L,i}^{\mathrm{actual}}}{\delta_i^{\mathrm{limit}}},
+\frac{\delta_{R,i}^{\mathrm{actual}}}{\delta_i^{\mathrm{limit}}}
+\right].
+$$
+
+这四个量来自推进器动力学更新后的实际反馈，不是 `last_actions` 或当前命令的重复。它们让 Actor 能判断命令—执行之间的滞后和剩余调节能力。将其追加在旧自身观测之后，可以保持原 89 维字段的索引不变，便于安全迁移旧模型首层权重。
 
 ## 10. 邻居 attention 输入，30 维
 
@@ -540,12 +525,12 @@ $$
 
 最终输出 4 维动作均值，动作分布仍是 tanh-squashed diagonal Gaussian。
 
-## 12. Centralized Critic 全局状态，90 维
+## 12. Centralized Critic 全局状态，82 维
 
 MAPPO critic 不使用 actor 的 93 维局部观测，而是使用 `get_global_state()` 构造的 canonical global state。默认 4 条拖轮时维度为：
 
 $$
-2 + 4\times 19 + 4\times 3 = 90.
+2 + 4\times 17 + 4\times 3 = 82.
 $$
 
 ### 12.1 大船段，2 维
@@ -561,9 +546,9 @@ $$
 
 当前大船模型直行且不使用横向速度、偏航角速度；船长和船宽默认不随机化，因此这些常量不再进入 critic。
 
-### 12.2 每条拖轮段，19 维
+### 12.2 每条拖轮段，17 维
 
-对每条拖轮，critic 使用大船船体系下的位置、速度、相对朝向、执行器、动作、route 进度和船体距离。固定 `tug_to_slot = arange(n_tugs)` 下的 slot one-hot 是常量，已从 critic 状态中移除。
+对每条拖轮，critic 使用大船船体系下的位置、速度、相对朝向、实际执行器、动作、进区保持进度和船体距离。
 
 | 相对索引 | 维数 | 内容 |
 |---:|---:|---|
@@ -573,10 +558,8 @@ $$
 | 6 | 1 | 拖轮偏航角速度，除以 0.5 |
 | 7-10 | 4 | 执行器实际值，已归一化 |
 | 11-14 | 4 | 上一步动作 |
-| 15 | 1 | route stage 进度 |
-| 16 | 1 | route remaining，除以 500 |
-| 17 | 1 | in-zone hold 进度 |
-| 18 | 1 | 到大船船体的最近距离，除以 50 |
+| 15 | 1 | in-zone hold 进度 |
+| 16 | 1 | 到大船船体的最近距离，除以 50 |
 
 ### 12.3 每条拖轮加速度 tail，3 维
 

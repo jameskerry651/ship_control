@@ -1,6 +1,8 @@
 """拖轮编队环境的观测与全局状态构建。
 
-构建每个智能体的93维观测向量，以及用于中心化评论器的90维标准全局状态。
+构建每个智能体的动态维度观测向量，以及用于中心化评论器的标准全局状态。
+
+默认配置是每智能体 93 维观测、4 拖轮时 82 维全局状态。
 
 子模块不持有 ``FormationEnv`` 引用，改为通过 ``SimState`` 和显式参数接收数据。
 维度常量统一来自 ``env/obs_spec.py``，坐标变换移入 ``env/state.py``。
@@ -14,15 +16,8 @@ import numpy as np
 
 from env.obs_spec import (
     ACTION_DIM,
+    ObservationSpec,
     _EGO_MOTION_OBS_DIM,
-    _ACTION_HISTORY_OBS_DIM,
-    _SHIP_REL_OBS_DIM,
-    _SHIP_PREVIEW_POINT_DIM,
-    _SLOT_TARGET_OBS_DIM,
-    _ROUTE_TARGET_OBS_DIM,
-    _HULL_CLEARANCE_OBS_DIM,
-    _NEIGHBOR_COUNT,
-    _NEIGHBOR_OBS_DIM,
     _NEIGHBOR_TCPA_SCALE_S,
     _NEIGHBOR_REL_SPEED_EPS,
 )
@@ -42,10 +37,7 @@ class Observer:
     # ----------------------------------------------------------- motion frame
 
     @staticmethod
-    def _motion_frame(
-        tug_u: float, tug_v: float, tug_r: float,
-        prev_u: float | None, prev_v: float | None, prev_r: float | None,
-    ) -> np.ndarray:
+    def _motion_frame(tug_u: float, tug_v: float, tug_r: float, prev_u: float | None, prev_v: float | None, prev_r: float | None) -> np.ndarray:
         """单帧运动特征（6 维），用于填充历史缓冲区。"""
         if prev_u is None:
             du = dv = dr = 0.0
@@ -68,39 +60,22 @@ class Observer:
     # --------------------------------------------------- history-buffer helpers
 
     @staticmethod
-    def fill_obs_history(
-        motion_history: np.ndarray,
-        action_history: np.ndarray,
-        tugs: list,
-        actions: np.ndarray,
-    ) -> None:
+    def fill_obs_history(motion_history: np.ndarray, action_history: np.ndarray, tugs: list, actions: np.ndarray) -> None:
         """初始化历史缓冲区（reset 时调用）。"""
         actions = np.clip(actions, -1.0, 1.0).astype(np.float32, copy=False)
         for i, tug in enumerate(tugs):
-            motion_history[i, :, :] = Observer._motion_frame(
-                tug.nu.x, tug.nu.y, tug.nu.z, None, None, None,
-            )
+            motion_history[i, :, :] = Observer._motion_frame(tug.nu.x, tug.nu.y, tug.nu.z, None, None, None)
             action_history[i, :, :] = actions[i]
 
     @staticmethod
-    def append_obs_history(
-        motion_history: np.ndarray,
-        action_history: np.ndarray,
-        tugs: list,
-        actions: np.ndarray,
-        prev_nu: np.ndarray,
-    ) -> None:
+    def append_obs_history(motion_history: np.ndarray, action_history: np.ndarray, tugs: list, actions: np.ndarray, prev_nu: np.ndarray) -> None:
         """追加一帧到历史缓冲区（step 后调用）。"""
         motion_history[:, 1:, :] = motion_history[:, :-1, :].copy()
         action_history[:, 1:, :] = action_history[:, :-1, :].copy()
         for i, tug in enumerate(tugs):
             motion_history[i, 0, :] = Observer._motion_frame(
-                tug.nu.x, tug.nu.y, tug.nu.z,
-                float(prev_nu[i, 0]), float(prev_nu[i, 1]), float(prev_nu[i, 2]),
-            )
-        action_history[:, 0, :] = np.clip(actions, -1.0, 1.0).astype(
-            np.float32, copy=False
-        )
+                tug.nu.x, tug.nu.y, tug.nu.z, float(prev_nu[i, 0]), float(prev_nu[i, 1]), float(prev_nu[i, 2]))
+        action_history[:, 0, :] = np.clip(actions, -1.0, 1.0).astype(np.float32, copy=False)
 
     # --------------------------------------------------------- observation
 
@@ -109,7 +84,7 @@ class Observer:
         state: SimState,
         motion_history: np.ndarray,
         action_history: np.ndarray,
-        obs_dim: int,
+        spec: ObservationSpec,
     ) -> np.ndarray:
         """构建每个 agent 的观测向量。
 
@@ -117,14 +92,35 @@ class Observer:
             state: 当前仿真状态快照
             motion_history: (n_tugs, hist_len, _EGO_MOTION_OBS_DIM)
             action_history: (n_tugs, hist_len, ACTION_DIM)
-            obs_dim: 单个 agent 的总观测维度
+            spec: 本次运行固定的观测布局
         返回：
             obs: (n_tugs, obs_dim) float32
         """
         n_tugs = state.n_tugs
-        obs = np.zeros((n_tugs, obs_dim), dtype=np.float32)
+        if motion_history.shape != (n_tugs, spec.history_len, spec.motion_dim):
+            raise ValueError(
+                "motion_history shape does not match ObservationSpec: "
+                f"got {motion_history.shape}, expected "
+                f"{(n_tugs, spec.history_len, spec.motion_dim)}"
+            )
+        if action_history.shape != (
+            n_tugs,
+            spec.history_len,
+            spec.action_history_dim,
+        ):
+            raise ValueError(
+                "action_history shape does not match ObservationSpec: "
+                f"got {action_history.shape}, expected "
+                f"{(n_tugs, spec.history_len, spec.action_history_dim)}"
+            )
+        obs = np.zeros((n_tugs, spec.total_dim), dtype=np.float32)
         ship = state.ship
         preview_times = tuple(getattr(state.cfg, "obs_ship_preview_times_s", (5.0, 10.0, 15.0)))
+        if len(preview_times) != spec.preview_count:
+            raise ValueError(
+                "ship preview configuration changed after ObservationSpec creation: "
+                f"got {len(preview_times)} points, expected {spec.preview_count}"
+            )
 
         # 预先计算所有拖轮的世界系速度
         tug_world_vx = np.zeros(n_tugs, dtype=np.float32)
@@ -133,16 +129,19 @@ class Observer:
             tug_world_vx[i], tug_world_vy[i] = tug.world_velocity()
 
         for i, tug in enumerate(state.tugs):
-            idx = 0
-            motion_len = motion_history.shape[1] * _EGO_MOTION_OBS_DIM
-            obs[i, idx:idx + motion_len] = motion_history[i].reshape(-1)
-            idx += motion_len
-
-            action_len = action_history.shape[1] * ACTION_DIM
-            obs[i, idx:idx + action_len] = action_history[i].reshape(-1)
-            idx += action_len
-
+            obs[i, spec.motion_history_slice] = motion_history[i].reshape(-1)
+            obs[i, spec.action_history_slice] = action_history[i].reshape(-1)
+            # -- 当前实际推进器反馈 (4 维) --
+            # 使用执行器经过速率限制后的真实状态，而不是策略命令。
+            if spec.thruster_state_dim:
+                obs[i, spec.thruster_state_slice] = (
+                    tug.port_rpm_actual / tug.rpm_limit,
+                    tug.starboard_rpm_actual / tug.rpm_limit,
+                    tug.port_azimuth_actual_deg / tug.azimuth_limit_deg,
+                    tug.starboard_azimuth_actual_deg / tug.azimuth_limit_deg,
+                )
             # -- 大船相对状态 (5 维) --
+            idx = spec.ship_relative_slice.start
             ship_dx_w = ship.x - tug.x
             ship_dy_w = ship.y - tug.y
             ship_dx_local, ship_dy_local = world_to_local(ship_dx_w, ship_dy_w, tug.psi)
@@ -152,9 +151,8 @@ class Observer:
             obs[i, idx + 2] = ship.u / 3.0
             obs[i, idx + 3] = math.sin(dpsi_ship)
             obs[i, idx + 4] = math.cos(dpsi_ship)
-            idx += _SHIP_REL_OBS_DIM
-
-            # -- 大船预瞄点 (3×2=6 维) --
+            # -- 大船预瞄点 (preview_count × 2 维) --
+            idx = spec.ship_preview_slice.start
             ship_vx_w, ship_vy_w = ship.world_velocity()
             for tau in preview_times:
                 t = float(tau)
@@ -167,14 +165,12 @@ class Observer:
                     dx_world_1, dy_world_1 = local_to_world(dx_body, dy_body, ship.psi)
                     ship_x_f = ship.x + dx_world_1
                     ship_y_f = ship.y + dy_world_1
-                dx_local, dy_local = world_to_local(
-                    ship_x_f - tug.x, ship_y_f - tug.y, tug.psi,
-                )
+                dx_local, dy_local = world_to_local(ship_x_f - tug.x, ship_y_f - tug.y, tug.psi)
                 obs[i, idx + 0] = dx_local / 100.0
                 obs[i, idx + 1] = dy_local / 100.0
-                idx += _SHIP_PREVIEW_POINT_DIM
-
+                idx += spec.preview_point_dim
             # -- 目标槽位 (5 维) --
+            idx = spec.slot_target_slice.start
             slot = state.slot_positions_world[state.tug_to_slot[i]]
             slot_dx_w = float(slot[0]) - tug.x
             slot_dy_w = float(slot[1]) - tug.y
@@ -186,75 +182,58 @@ class Observer:
             obs[i, idx + 2] = min(slot_dist / 100.0, 10.0)
             obs[i, idx + 3] = math.sin(dpsi_slot)
             obs[i, idx + 4] = math.cos(dpsi_slot)
-            idx += _SLOT_TARGET_OBS_DIM
-
-            # -- 路径目标 (4 维) --
-            route_target = state.current_route_target_world(i)
-            route_dx_w = float(route_target[0]) - tug.x
-            route_dy_w = float(route_target[1]) - tug.y
-            route_dx_local, route_dy_local = world_to_local(route_dx_w, route_dy_w, tug.psi)
-            route_len = len(state.route_waypoints_body_for_tug(i))
-            stage_norm = float(state.route_stage[i]) / max(route_len - 1, 1)
-            obs[i, idx + 0] = route_dx_local / 100.0
-            obs[i, idx + 1] = route_dy_local / 100.0
-            obs[i, idx + 2] = float(np.clip(stage_norm, 0.0, 1.0))
-            obs[i, idx + 3] = float(state.route_remaining_distance(i)) / 500.0
-            idx += _ROUTE_TARGET_OBS_DIM
-
             # -- 船体间隙 (3 维) --
+            idx = spec.hull_clearance_slice.start
             tug_x_body, tug_y_body = ship.world_to_body(tug.x, tug.y)
             hull_x_body, hull_y_body = _closest_hull_point_body(
-                float(tug_x_body), float(tug_y_body),
-                ship.length_m, ship.beam_m,
-            )
+                float(tug_x_body), float(tug_y_body), ship.length_m, ship.beam_m)
             hull_x_world, hull_y_world = ship.body_to_world(hull_x_body, hull_y_body)
-            hull_dx_local, hull_dy_local = world_to_local(
-                hull_x_world - tug.x, hull_y_world - tug.y, tug.psi,
-            )
+            hull_dx_local, hull_dy_local = world_to_local(hull_x_world - tug.x, hull_y_world - tug.y, tug.psi)
             obs[i, idx + 0] = hull_dx_local / 50.0
             obs[i, idx + 1] = hull_dy_local / 50.0
             obs[i, idx + 2] = float(ship.distance_from_hull(tug.x, tug.y)) / 50.0
-            idx += _HULL_CLEARANCE_OBS_DIM
-
-            # -- 邻居特征 (3×10=30 维) --
+            # -- 邻居特征 (neighbor_count×10 维，不足时填零) --
             other_idx = [j for j in range(n_tugs) if j != i]
-            for j in other_idx:
-                other = state.tugs[j]
-                dx_w = other.x - tug.x
-                dy_w = other.y - tug.y
-                dx_local, dy_local = world_to_local(dx_w, dy_w, tug.psi)
-                du_local, dv_local = world_to_local(
-                    float(tug_world_vx[j] - tug_world_vx[i]),
-                    float(tug_world_vy[j] - tug_world_vy[i]),
-                    tug.psi,
-                )
-                dist = math.hypot(dx_local, dy_local)
-                bearing = math.atan2(dy_local, dx_local)
-                if dist > _NEIGHBOR_REL_SPEED_EPS:
-                    range_rate = (dx_local * du_local + dy_local * dv_local) / dist
-                else:
-                    range_rate = 0.0
-                rel_speed_sq = du_local * du_local + dv_local * dv_local
-                if rel_speed_sq > _NEIGHBOR_REL_SPEED_EPS:
-                    tcpa = -(dx_local * du_local + dy_local * dv_local) / rel_speed_sq
-                    tcpa = max(tcpa, 0.0)
-                    cpa_x = dx_local + du_local * tcpa
-                    cpa_y = dy_local + dv_local * tcpa
-                    dcpa = math.hypot(cpa_x, cpa_y)
-                else:
-                    tcpa = _NEIGHBOR_TCPA_SCALE_S
-                    dcpa = dist
-                obs[i, idx + 0] = dx_local / 100.0
-                obs[i, idx + 1] = dy_local / 100.0
-                obs[i, idx + 2] = min(dist / 100.0, 10.0)
-                obs[i, idx + 3] = math.sin(bearing)
-                obs[i, idx + 4] = math.cos(bearing)
-                obs[i, idx + 5] = du_local / 5.0
-                obs[i, idx + 6] = dv_local / 5.0
-                obs[i, idx + 7] = range_rate / 5.0
-                obs[i, idx + 8] = min(tcpa / _NEIGHBOR_TCPA_SCALE_S, 10.0)
-                obs[i, idx + 9] = min(dcpa / 100.0, 10.0)
-                idx += _NEIGHBOR_OBS_DIM
+            for k in range(spec.neighbor_count):
+                idx = spec.neighbor_item_slice(k).start
+                if k < len(other_idx):
+                    j = other_idx[k]
+                    other = state.tugs[j]
+                    dx_w = other.x - tug.x
+                    dy_w = other.y - tug.y
+                    dx_local, dy_local = world_to_local(dx_w, dy_w, tug.psi)
+                    du_local, dv_local = world_to_local(
+                        float(tug_world_vx[j] - tug_world_vx[i]),
+                        float(tug_world_vy[j] - tug_world_vy[i]),
+                        tug.psi,
+                    )
+                    dist = math.hypot(dx_local, dy_local)
+                    bearing = math.atan2(dy_local, dx_local)
+                    if dist > _NEIGHBOR_REL_SPEED_EPS:
+                        range_rate = (dx_local * du_local + dy_local * dv_local) / dist
+                    else:
+                        range_rate = 0.0
+                    rel_speed_sq = du_local * du_local + dv_local * dv_local
+                    if rel_speed_sq > _NEIGHBOR_REL_SPEED_EPS:
+                        tcpa = -(dx_local * du_local + dy_local * dv_local) / rel_speed_sq
+                        tcpa = max(tcpa, 0.0)
+                        cpa_x = dx_local + du_local * tcpa
+                        cpa_y = dy_local + dv_local * tcpa
+                        dcpa = math.hypot(cpa_x, cpa_y)
+                    else:
+                        tcpa = _NEIGHBOR_TCPA_SCALE_S
+                        dcpa = dist
+                    obs[i, idx + 0] = dx_local / 100.0
+                    obs[i, idx + 1] = dy_local / 100.0
+                    obs[i, idx + 2] = min(dist / 100.0, 10.0)
+                    obs[i, idx + 3] = math.sin(bearing)
+                    obs[i, idx + 4] = math.cos(bearing)
+                    obs[i, idx + 5] = du_local / 5.0
+                    obs[i, idx + 6] = dv_local / 5.0
+                    obs[i, idx + 7] = range_rate / 5.0
+                    obs[i, idx + 8] = min(tcpa / _NEIGHBOR_TCPA_SCALE_S, 10.0)
+                    obs[i, idx + 9] = min(dcpa / 100.0, 10.0)
+                # else: leave as zeros (already initialized)
 
         np.clip(obs, -10.0, 10.0, out=obs)
         return obs

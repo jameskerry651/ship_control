@@ -12,39 +12,30 @@
       │     ├── cfg, n_tugs, dt_ctrl
       │     ├── ship snapshot
       │     ├── tug snapshots (tuple)
-      │     ├── slot positions
-      │     ├── route waypoints (pre-computed)
-      │     └── derived helpers (coordinate transforms, hull queries)
+  │     ├── slot positions
+  │     └── derived helpers (coordinate transforms, hull queries)
       │
-      └── MutableEpisodeState (mutated by submodules, returned as updates)
-            ├── in_zone_steps
-            ├── route_stage
-            ├── route_waypoints_body_cache
-            └── prev_* tracking arrays
+       └── MutableEpisodeState (mutated by submodules, returned as updates)
+             ├── in_zone_steps
+             └── prev_* tracking arrays
 """
 
 from __future__ import annotations
-
 import math
 from dataclasses import dataclass, field
 from typing import Callable
-
 import numpy as np
 
 from config import EnvConfig
 from env.obs_spec import _GLOBAL_ACCEL_PER_TUG_DIM, _GLOBAL_PER_TUG_DIM, _GLOBAL_SHIP_DIM, _SHIP_LINEAR_ACCEL_SCALE, _TUG_LINEAR_ACCEL_SCALE, _TUG_YAW_ACCEL_SCALE
 from physics.large_ship_model import _wrap_pi
 
-
-def _closest_hull_point_body(
-    x_body: float, y_body: float, length_m: float, beam_m: float
-) -> tuple[float, float]:
+def _closest_hull_point_body(x_body: float, y_body: float, length_m: float, beam_m: float) -> tuple[float, float]:
     """Closest point on the rectangular collision hull in ship body coordinates."""
     l_half = length_m / 2.0
     b_half = beam_m / 2.0
     clamped_x = float(np.clip(x_body, -l_half, l_half))
     clamped_y = float(np.clip(y_body, -b_half, b_half))
-
     if abs(x_body) <= l_half and abs(y_body) <= b_half:
         dx_edge = l_half - abs(x_body)
         dy_edge = b_half - abs(y_body)
@@ -52,9 +43,7 @@ def _closest_hull_point_body(
             clamped_x = math.copysign(l_half, x_body if x_body != 0.0 else 1.0)
         else:
             clamped_y = math.copysign(b_half, y_body if y_body != 0.0 else 1.0)
-
     return clamped_x, clamped_y
-
 
 def world_to_local(dx: float, dy: float, psi_local: float) -> tuple[float, float]:
     """世界系向量旋转到本地坐标系。"""
@@ -62,13 +51,11 @@ def world_to_local(dx: float, dy: float, psi_local: float) -> tuple[float, float
     s = math.sin(psi_local)
     return c * dx + s * dy, -s * dx + c * dy
 
-
 def local_to_world(dx_local: float, dy_local: float, psi_local: float) -> tuple[float, float]:
     """局部坐标系向量旋转到世界系。"""
     c = math.cos(psi_local)
     s = math.sin(psi_local)
     return c * dx_local - s * dy_local, s * dx_local + c * dy_local
-
 
 @dataclass
 class ShipSnapshot:
@@ -114,14 +101,7 @@ class ShipSnapshot:
         ey = max(abs(y_b) - b_half, 0.0)
         return math.hypot(ex, ey)
 
-    def distance_from_hull_pose(
-        self,
-        x_world: float,
-        y_world: float,
-        ship_x: float,
-        ship_y: float,
-        ship_psi: float,
-    ) -> float:
+    def distance_from_hull_pose(self, x_world: float, y_world: float, ship_x: float, ship_y: float, ship_psi: float) -> float:
         """给定大船位姿下，世界坐标点到船体外廓的最近距离。"""
         dx = x_world - ship_x
         dy = y_world - ship_y
@@ -162,7 +142,6 @@ class ShipSnapshot:
             world[k, 2] = self.psi
         return world
 
-
 @dataclass
 class TugSnapshot:
     """不可变的单艇状态快照。"""
@@ -188,13 +167,12 @@ class TugSnapshot:
         s = math.sin(self.psi)
         return c * self.u - s * self.v, s * self.u + c * self.v
 
-
 @dataclass
 class SimState:
     """一次 step 的不可变仿真快照。
 
-    由 ``FormationEnv`` 在 reset/step 后构建，传递给 Observer、RewardComputer、
-    RoutePlanner 等子模块，替代原来直接传递 ``FormationEnv`` 引用的紧耦合设计。
+     由 ``FormationEnv`` 在 reset/step 后构建，传递给 Observer、RewardComputer
+     等子模块，替代原来直接传递 ``FormationEnv`` 引用的紧耦合设计。
 
     子模块通过 ``SimState`` 读取所需数据，通过 ``MutableEpisodeState`` 读写可变追踪状态。
     """
@@ -205,37 +183,7 @@ class SimState:
     tugs: tuple[TugSnapshot, ...]
     slot_positions_world: np.ndarray   # (n_tugs, 3) world frame
     tug_to_slot: np.ndarray            # (n_tugs,) int
-    route_stage: np.ndarray            # (n_tugs,) int
-    route_waypoints_body: dict[int, np.ndarray]   # tug_idx → (M, 2) body frame
-    route_waypoints_world: dict[int, np.ndarray]  # tug_idx → (M, 2) world frame
     last_actions: np.ndarray           # (n_tugs, 4)
-    init_mode: str
-
-    @property
-    def uses_route_mode(self) -> bool:
-        return self.init_mode == "mixed_slot_approach"
-
-    # -- route accessors (delegated from RoutePlanner) --
-
-    def route_waypoints_body_for_tug(self, tug_idx: int) -> np.ndarray:
-        return self.route_waypoints_body.get(tug_idx, np.zeros((0, 2), dtype=np.float64))
-
-    def route_waypoints_world_for_tug(self, tug_idx: int) -> np.ndarray:
-        return self.route_waypoints_world.get(tug_idx, np.zeros((0, 2), dtype=np.float64))
-
-    def current_route_target_world(self, tug_idx: int) -> np.ndarray:
-        waypoints = self.route_waypoints_world_for_tug(tug_idx)
-        stage = int(np.clip(self.route_stage[tug_idx], 0, len(waypoints) - 1))
-        return waypoints[stage]
-
-    def route_remaining_distance(self, tug_idx: int) -> float:
-        waypoints = self.route_waypoints_world_for_tug(tug_idx)
-        stage = int(np.clip(self.route_stage[tug_idx], 0, len(waypoints) - 1))
-        tug = self.tugs[tug_idx]
-        rem = math.hypot(tug.x - waypoints[stage, 0], tug.y - waypoints[stage, 1])
-        for k in range(stage, len(waypoints) - 1):
-            rem += float(np.linalg.norm(waypoints[k + 1] - waypoints[k]))
-        return float(rem)
 
     # -- hull clearance helper --
 
@@ -244,15 +192,13 @@ class SimState:
         tug = self.tugs[tug_idx]
         tug_x_body, tug_y_body = self.ship.world_to_body(tug.x, tug.y)
         hull_x_body, hull_y_body = _closest_hull_point_body(
-            float(tug_x_body), float(tug_y_body),
-            self.ship.length_m, self.ship.beam_m,
-        )
+            float(tug_x_body), float(tug_y_body), self.ship.length_m, self.ship.beam_m)
         return self.ship.body_to_world(hull_x_body, hull_y_body)
 
     # -- global state construction helper (used by Observer.get_global_state) --
 
     def build_global_state_array(self, in_zone_steps: np.ndarray) -> np.ndarray:
-        """构建 90 维全局状态数组（供中心化 Critic 使用）。"""
+        """构建全局状态数组（供中心化 Critic 使用，维度 = 2 + 17*n_tugs + 3*n_tugs）。"""
         n = self.n_tugs
         total_dim = _GLOBAL_SHIP_DIM + _GLOBAL_PER_TUG_DIM * n + _GLOBAL_ACCEL_PER_TUG_DIM * n
         state = np.zeros(total_dim, dtype=np.float32)
@@ -263,10 +209,8 @@ class SimState:
         cs_s = math.cos(self.ship.psi)
         sn_s = math.sin(self.ship.psi)
         hold_steps = max(1, int(round(self.cfg.hold_time_s / self.dt_ctrl)))
-
         for i, tug in enumerate(self.tugs):
             base = _GLOBAL_SHIP_DIM + i * _GLOBAL_PER_TUG_DIM
-
             x_b, y_b = self.ship.world_to_body(tug.x, tug.y)
             state[base + 0] = float(x_b) / 100.0
             state[base + 1] = float(y_b) / 100.0
@@ -292,16 +236,10 @@ class SimState:
 
             state[base + 11:base + 15] = self.last_actions[i]
 
-            route_len = len(self.route_waypoints_body_for_tug(i))
-            stage_norm = float(self.route_stage[i]) / max(route_len - 1, 1)
-            state[base + 15] = float(np.clip(stage_norm, 0.0, 1.0))
-            state[base + 16] = float(self.route_remaining_distance(i)) / 500.0
-
-            state[base + 17] = float(in_zone_steps[i]) / float(hold_steps)
+            state[base + 15] = float(in_zone_steps[i]) / float(hold_steps)
 
             d_hull = self.ship.distance_from_hull(tug.x, tug.y)
-            state[base + 18] = float(d_hull) / 50.0
-
+            state[base + 16] = float(d_hull) / 50.0
             acc_base = _GLOBAL_SHIP_DIM + _GLOBAL_PER_TUG_DIM * n + i * _GLOBAL_ACCEL_PER_TUG_DIM
             ax_w = ci * tug.u_dot - si * tug.v_dot
             ay_w = si * tug.u_dot + ci * tug.v_dot
@@ -314,46 +252,30 @@ class SimState:
         np.clip(state, -10.0, 10.0, out=state)
         return state
 
-
 def _make_tug_snapshot(tug) -> TugSnapshot:
     """从 ``TugboatDynamicsModel`` 构建 ``TugSnapshot``。"""
     ctrl = tug.get_control_snapshot()
     acc = tug.get_last_nu_dot()
     return TugSnapshot(
-        x=tug.eta.x,
-        y=tug.eta.y,
-        psi=tug.eta.z,
-        u=tug.nu.x,
-        v=tug.nu.y,
-        r=tug.nu.z,
-        u_dot=acc.x,
-        v_dot=acc.y,
-        r_dot=acc.z,
+        x=tug.eta.x, y=tug.eta.y, psi=tug.eta.z,
+        u=tug.nu.x, v=tug.nu.y, r=tug.nu.z,
+        u_dot=acc.x, v_dot=acc.y, r_dot=acc.z,
         port_rpm_actual=ctrl["port_rpm_actual"],
         starboard_rpm_actual=ctrl["starboard_rpm_actual"],
         port_azimuth_actual_deg=ctrl["port_azimuth_actual_deg"],
         starboard_azimuth_actual_deg=ctrl["starboard_azimuth_actual_deg"],
-        rpm_limit=tug.rpm_limit,
-        azimuth_limit_deg=tug.azimuth_limit_deg,
+        rpm_limit=tug.rpm_limit, azimuth_limit_deg=tug.azimuth_limit_deg,
     )
-
 
 def _make_ship_snapshot(ship) -> ShipSnapshot:
     """从 ``LargeShipModel`` 构建 ``ShipSnapshot``。"""
     return ShipSnapshot(
-        x=ship.x,
-        y=ship.y,
-        psi=ship.psi,
-        u=ship.u,
-        v=ship.v,
-        r=ship.r,
-        u_dot=ship.u_dot,
-        length_m=ship.length_m,
-        beam_m=ship.beam_m,
+        x=ship.x, y=ship.y, psi=ship.psi,
+        u=ship.u, v=ship.v, r=ship.r,
+        u_dot=ship.u_dot, length_m=ship.length_m, beam_m=ship.beam_m,
         slot_lon_offset_m=getattr(ship, "slot_lon_offset_m", 30.0),
         slot_lat_offset_m=getattr(ship, "slot_lat_offset_m", 10.0),
     )
-
 
 @dataclass
 class MutableEpisodeState:
@@ -363,11 +285,15 @@ class MutableEpisodeState:
     这种设计避免了子模块需要通过 ``self._env`` 来修改 env 的私有状态。
     """
     in_zone_steps: np.ndarray           # (n_tugs,) int
-    route_stage: np.ndarray             # (n_tugs,) int
-    route_waypoints_body_cache: dict[int, np.ndarray]
-    mixed_ready_tugs: set[int]
     prev_dist: np.ndarray               # (n_tugs,)
-    prev_route_remaining: np.ndarray    # (n_tugs,)
     prev_d_hull: np.ndarray             # (n_tugs,)
     prev_speed_err: np.ndarray          # (n_tugs,)
     prev_heading_err: np.ndarray        # (n_tugs,)
+    # Capture / Track 阶段
+    capture_done: bool = False          # 是否已完成短时入位（hold_time）
+    just_captured: bool = False         # 本步是否刚触发 capture（发一次 bonus）
+    phase: str = "approach"             # approach | track
+    # Track 阶段内全体同时 in-zone 的连续步数（离开则清零，capture 状态保留）
+    track_streak_steps: int = 0
+    track_steps_total: int = 0          # 进入 track 后的总步数
+    track_steps_all_in_zone: int = 0    # 进入 track 后全体 in-zone 的步数

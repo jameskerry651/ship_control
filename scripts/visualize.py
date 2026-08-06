@@ -1,6 +1,6 @@
 """pygame visualization for tugboat formation env."""
 from __future__ import annotations
-import argparse, math, sys, time
+import argparse, math, os, sys, time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
@@ -23,6 +23,7 @@ import pygame
 import torch
 from config import EnvConfig, PPOConfig, VizConfig
 from env.formation_env import FormationEnv
+from env.obs_spec import ObservationSpec
 from utils.mpl_fonts import configure_matplotlib_fonts
 from rl.ppo import MAPPOActorCritic
 
@@ -36,7 +37,9 @@ def _load_visualization_state(
     load_state: dict[str, torch.Tensor] = {}
     migrated: list[str] = []
     skipped: list[str] = []
-    actor_arch_changed = "actor.own_encoder.0.weight" not in state
+    src_is_transformer = "actor.temporal_encoder.input_proj.weight" in state
+    dst_is_transformer = "actor.temporal_encoder.input_proj.weight" in dst_state
+    actor_arch_changed = src_is_transformer != dst_is_transformer
 
     for key, dst_tensor in dst_state.items():
         if actor_arch_changed and key.startswith("actor.") and key != "actor.log_std":
@@ -53,7 +56,12 @@ def _load_visualization_state(
             continue
 
         if (
-            key in ("actor.own_encoder.0.weight", "critic.0.weight", "critic.critic.0.weight")
+            key in (
+                "actor.own_encoder.0.weight",
+                "actor.context_encoder.0.weight",
+                "critic.0.weight",
+                "critic.critic.0.weight",
+            )
             and src_tensor.ndim == 2
             and dst_tensor.ndim == 2
             and src_tensor.shape[0] == dst_tensor.shape[0]
@@ -655,8 +663,6 @@ def run_visualization(
         if ckpt_env_cfg:
             if "tug_init_mode" not in ckpt_env_cfg:
                 env_cfg.tug_init_mode = "mixed_slot_approach"
-            if "ship_size_randomize" not in ckpt_env_cfg:
-                env_cfg.ship_size_randomize = False
 
         ppo_cfg = PPOConfig()
         for key, value in checkpoint.get("ppo_cfg", {}).items():
@@ -676,6 +682,19 @@ def run_visualization(
             else:
                 raise RuntimeError("checkpoint does not contain recognizable MAPPO actor weights")
         dummy_env = FormationEnv(cfg=env_cfg)
+        saved_spec_raw = checkpoint.get("observation_spec")
+        if saved_spec_raw is None:
+            saved_spec_raw = ckpt_model_kwargs.get("observation_spec")
+        if saved_spec_raw is not None:
+            saved_spec = ObservationSpec.from_dict(saved_spec_raw)
+            differences = saved_spec.differences(dummy_env.observation_spec)
+            if differences and not dummy_env.observation_spec.is_thruster_feedback_upgrade_from(
+                saved_spec
+            ):
+                raise ValueError(
+                    "checkpoint ObservationSpec is incompatible with its visualization "
+                    f"environment: {differences}"
+                )
         if actual_obs_dim != dummy_env.obs_dim:
             print(
                 f"checkpoint obs_dim={actual_obs_dim}, env obs_dim={dummy_env.obs_dim}; "
@@ -689,11 +708,23 @@ def run_visualization(
             # 还原真实 global_state_dim 再传入（MAPPOCritic 内部会再加回 one-hot）
             trunk_in = int(state[f"{critic_prefix}.0.weight"].shape[1])
             critic_in_dim = trunk_in - env_cfg.n_tugs
+        actor_arch = str(ckpt_model_kwargs.get("actor_arch", getattr(ppo_cfg, "actor_arch", "mlp")))
+        hist_len = ckpt_model_kwargs.get("hist_len")
+        if hist_len is None:
+            hist_len = int(getattr(env_cfg, "obs_history_k", 3)) + 1
         policy = MAPPOActorCritic(
             obs_dim=dummy_env.obs_dim,
             action_dim=dummy_env.action_dim,
             n_agents=env_cfg.n_tugs,
             global_state_dim=critic_in_dim or dummy_env.global_state_dim,
+            actor_arch=actor_arch,
+            hist_len=int(hist_len),
+            observation_spec=dummy_env.observation_spec.to_dict(),
+            tf_d_model=int(ckpt_model_kwargs.get("tf_d_model", ppo_cfg.tf_d_model)),
+            tf_nhead=int(ckpt_model_kwargs.get("tf_nhead", ppo_cfg.tf_nhead)),
+            tf_num_layers=int(ckpt_model_kwargs.get("tf_num_layers", ppo_cfg.tf_num_layers)),
+            tf_ffn_dim=int(ckpt_model_kwargs.get("tf_ffn_dim", ppo_cfg.tf_ffn_dim)),
+            tf_dropout=float(ckpt_model_kwargs.get("tf_dropout", ppo_cfg.tf_dropout)),
         )
         migrated, skipped = _load_visualization_state(policy, state)
         if migrated:
@@ -900,13 +931,31 @@ def run_visualization(
     pygame.quit()
 
 
+def _find_latest_best_pt(checkpoints_dir: str = "checkpoints") -> str | None:
+    """在 checkpoints 目录下找最新修改的 best.pt。"""
+    import glob as _glob
+    candidates = _glob.glob(f"{checkpoints_dir}/**/best.pt", recursive=True)
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Tugboat formation visualization")
-    parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="模型权重路径（默认自动查找 checkpoints 下最新 best.pt）")
     parser.add_argument("--random", action="store_true")
     parser.add_argument("--speed", type=float, default=1.0)
     args = parser.parse_args()
-    run_visualization(checkpoint_path=args.ckpt, random_policy=args.random, speed=args.speed)
+
+    ckpt = args.ckpt
+    if ckpt is None and not args.random:
+        ckpt = _find_latest_best_pt()
+        if ckpt:
+            print(f"[viz] auto-detected checkpoint: {ckpt}")
+        else:
+            print("[viz] no checkpoint found, falling back to random policy")
+    run_visualization(checkpoint_path=ckpt, random_policy=args.random, speed=args.speed)
 
 
 if __name__ == "__main__":

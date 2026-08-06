@@ -28,7 +28,7 @@ class EnvConfig:
     slot_lon_offset_m: float = 20.0
     slot_lat_offset_m: float = 25.0
 
-    # 初始化（圆环半径；远距课程可调回 150/200，训练用 --init-radius）
+    # 初始化（圆环半径；远距复现可用 --init-radius 200）
     tug_init_mode: str = "circle"
     tug_init_radius_m: float = 100.0
 

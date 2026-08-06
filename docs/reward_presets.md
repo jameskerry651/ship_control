@@ -24,17 +24,26 @@
 
 ## 命令
 
+推荐用脚本串行跑（默认 `env-backend=sync`、`num-envs=2`，日志写到 `outputs/logs/reward_preset_ablation.log`）：
+
 ```bash
-for p in rw_baseline rw_dist_up rw_ship_safe_dn rw_coll_soft rw_shape_up rw_combo; do
-  python scripts/train.py \
-    --arch transformer \
-    --init-radius 100 \
-    --reward-preset "$p" \
-    --run-name "$p" \
-    --total-steps 1000000 \
-    --seed 42
-done
+python scripts/run_reward_preset_ablation.py
 ```
+
+常用选项：
+
+```bash
+# 只跑部分 preset
+python scripts/run_reward_preset_ablation.py --presets rw_baseline rw_combo
+
+# 预览命令不训练
+python scripts/run_reward_preset_ablation.py --dry-run
+
+# 覆盖设备 / 环境后端
+python scripts/run_reward_preset_ablation.py --device mps --env-backend sync --num-envs 2
+```
+
+结束后会自动调用 `scripts/summarize_reward_presets.py`。
 
 ## 如何读结果
 

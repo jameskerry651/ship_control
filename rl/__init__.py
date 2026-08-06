@@ -1,6 +1,6 @@
 """MAPPO 强化学习算法。"""
 
-from rl.actor import MAPPOActor
+from rl.actor import MAPPOActor, TransformerMAPPOActor, build_actor
 from rl.critic import MAPPOCritic
 from rl.ppo import (
     MAPPOActorCritic,
@@ -12,6 +12,8 @@ from rl.ppo import (
 
 __all__ = [
     "MAPPOActor",
+    "TransformerMAPPOActor",
+    "build_actor",
     "MAPPOCritic",
     "MAPPOActorCritic",
     "MAPPORolloutBatch",

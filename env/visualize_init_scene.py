@@ -258,10 +258,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=4, help="随机场景数量（网格子图数）")
     parser.add_argument("--seed", type=int, default=0, help="第一个场景的随机种子")
     parser.add_argument("--init-mode", type=str, default=None,
-                        choices=["mixed_slot_approach"],
+                        choices=["circle", "mixed_slot_approach"],
                         help="覆盖 EnvConfig.tug_init_mode")
-    parser.add_argument("--no-ship-size-randomize", action="store_true",
-                        help="关闭大船尺度随机化")
     parser.add_argument("--output", type=str, default="outputs/init_scenes.png",
                         help="输出图片路径")
     parser.add_argument("--dpi", type=int, default=150, help="输出分辨率")
@@ -273,8 +271,6 @@ def main() -> None:
     env_cfg = EnvConfig()
     if args.init_mode is not None:
         env_cfg = replace(env_cfg, tug_init_mode=args.init_mode)
-    if args.no_ship_size_randomize:
-        env_cfg = replace(env_cfg, ship_size_randomize=False)
 
     out = PROJECT_ROOT / args.output
     saved = render_init_scenes(
@@ -285,10 +281,6 @@ def main() -> None:
         dpi=args.dpi,
     )
     print(f"[ok] saved: {saved}")
-    print(
-        f"     init_mode={env_cfg.tug_init_mode}, "
-        f"ship_size_randomize={env_cfg.ship_size_randomize}"
-    )
 
 
 if __name__ == "__main__":

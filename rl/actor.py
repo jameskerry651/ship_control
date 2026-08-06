@@ -3,22 +3,88 @@
 from __future__ import annotations
 
 import math
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-from env.obs_spec import _NEIGHBOR_COUNT, _NEIGHBOR_OBS_DIM, _OWN_OBS_DIM
+from env.obs_spec import (
+    DEFAULT_OBSERVATION_SPEC,
+    LEGACY_OBSERVATION_SPEC_V1,
+    ObservationSpec,
+    _NEIGHBOR_COUNT,
+    _NEIGHBOR_OBS_DIM,
+)
+from rl.temporal import TemporalTransformerEncoder
 
 # tanh 动作压缩时的数值稳定项，避免 log(0) 与 atanh 边界溢出
 _ACTION_SQUASH_EPS = 1e-6
-# 邻居观测总维度，供 attention 模块输入
-_ATTENTION_OBS_DIM = _NEIGHBOR_COUNT * _NEIGHBOR_OBS_DIM
 _LOG_STD_INIT = -0.5
 # log_std 的硬裁剪边界，防止 std 指数爆炸（上界）或熵塌缩（下界）导致训练不稳定
 _LOG_STD_MIN = -5.0
 _LOG_STD_MAX = 2.0
+
+
+def _resolve_observation_spec(
+    observation_spec: ObservationSpec | Mapping[str, Any] | None,
+    *,
+    obs_dim: int,
+    hist_len: int | None = None,
+) -> ObservationSpec:
+    """解析并校验 Actor 使用的观测契约。
+
+    无显式规格时识别默认 93 维和旧 89 维布局；为旧调用传入 ``hist_len`` 时，可从
+    ``obs_dim`` 反推出预瞄点数量。新训练代码应始终显式传入规格。
+    """
+    if isinstance(observation_spec, ObservationSpec):
+        spec = observation_spec
+    elif observation_spec is not None:
+        spec = ObservationSpec.from_dict(observation_spec)
+    elif hist_len is None and int(obs_dim) == DEFAULT_OBSERVATION_SPEC.total_dim:
+        spec = DEFAULT_OBSERVATION_SPEC
+    elif (
+        int(obs_dim) == LEGACY_OBSERVATION_SPEC_V1.total_dim
+        and (hist_len is None or int(hist_len) == LEGACY_OBSERVATION_SPEC_V1.history_len)
+    ):
+        spec = LEGACY_OBSERVATION_SPEC_V1
+    else:
+        resolved_hist_len = (
+            DEFAULT_OBSERVATION_SPEC.history_len if hist_len is None else int(hist_len)
+        )
+        fixed_without_preview = (
+            resolved_hist_len * DEFAULT_OBSERVATION_SPEC.history_token_dim
+            + DEFAULT_OBSERVATION_SPEC.ship_relative_dim
+            + DEFAULT_OBSERVATION_SPEC.thruster_state_dim
+            + DEFAULT_OBSERVATION_SPEC.slot_target_dim
+            + DEFAULT_OBSERVATION_SPEC.hull_clearance_dim
+            + DEFAULT_OBSERVATION_SPEC.attention_dim
+        )
+        preview_size = int(obs_dim) - fixed_without_preview
+        point_dim = DEFAULT_OBSERVATION_SPEC.preview_point_dim
+        if preview_size < 0 or preview_size % point_dim != 0:
+            raise ValueError(
+                "cannot infer ObservationSpec from "
+                f"obs_dim={obs_dim}, hist_len={resolved_hist_len}; "
+                "pass observation_spec explicitly"
+            )
+        spec = ObservationSpec(
+            history_len=resolved_hist_len,
+            preview_count=preview_size // point_dim,
+            neighbor_count=DEFAULT_OBSERVATION_SPEC.neighbor_count,
+        )
+
+    if hist_len is not None and int(hist_len) != spec.history_len:
+        raise ValueError(
+            f"hist_len={hist_len} disagrees with ObservationSpec.history_len="
+            f"{spec.history_len}"
+        )
+    if int(obs_dim) != spec.total_dim:
+        raise ValueError(
+            f"ObservationSpec expects obs_dim={spec.total_dim}, got {obs_dim}"
+        )
+    return spec
 
 
 def _atanh(x: torch.Tensor) -> torch.Tensor:
@@ -76,7 +142,7 @@ class SquashedDiagonalGaussian:
 
 
 class AttentionCollisionAvoidance(nn.Module):
-    """对三艘邻居拖轮做单头缩放点积注意力。"""
+    """对动态数量的邻居拖轮做单头缩放点积注意力。"""
 
     def __init__(self, own_feat_dim: int, neigh_feat_dim: int, embed_dim: int = 64) -> None:
         """
@@ -127,7 +193,13 @@ class AttentionCollisionAvoidance(nn.Module):
 class MAPPOActor(nn.Module):
     """去中心化 Actor：只看单个拖轮的局部观察 o_i。"""
 
-    def __init__(self, obs_dim: int, action_dim: int) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        *,
+        observation_spec: ObservationSpec | Mapping[str, Any] | None = None,
+    ) -> None:
         """
         初始化去中心化 Actor 网络。
 
@@ -137,7 +209,7 @@ class MAPPOActor(nn.Module):
         Parameters
         ----------
         obs_dim : int
-            总观测维度，必须等于 _OWN_OBS_DIM + _ATTENTION_OBS_DIM（本船观测 + 邻居观测）。
+            总观测维度，必须与 ``observation_spec.total_dim`` 一致。
         action_dim : int
             动作空间维度，即策略输出的连续动作分量数。
         """
@@ -145,16 +217,14 @@ class MAPPOActor(nn.Module):
 
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
-        self.own_obs_dim = _OWN_OBS_DIM
-        self.neighbor_count = _NEIGHBOR_COUNT
-        self.neighbor_obs_dim = _NEIGHBOR_OBS_DIM
-        expected_obs_dim = _OWN_OBS_DIM + _ATTENTION_OBS_DIM
-        if self.obs_dim != expected_obs_dim:
-            raise ValueError(
-                f"attention actor expects obs_dim={expected_obs_dim}, got {self.obs_dim}"
-            )
+        self.observation_spec = _resolve_observation_spec(
+            observation_spec, obs_dim=self.obs_dim
+        )
+        self.own_obs_dim = self.observation_spec.own_dim
+        self.neighbor_count = self.observation_spec.neighbor_count
+        self.neighbor_obs_dim = self.observation_spec.neighbor_dim
 
-        # 本船特征编码器：将本船观测 (63维) 编码为 64 维特征向量
+        # 本船特征编码器：输入维度由 ObservationSpec 派生。
         self.own_encoder = nn.Sequential(
             nn.Linear(self.own_obs_dim, 128),
             nn.LayerNorm(128),
@@ -171,7 +241,7 @@ class MAPPOActor(nn.Module):
             nn.Linear(64, 64),
             nn.Tanh(),
         )
-        # 注意力碰撞规避模块：对 3 个邻居做单头缩放点积注意力，输出 64 维环境威胁摘要
+        # 注意力碰撞规避模块：邻居数量由 ObservationSpec 派生。
         self.attention_block = AttentionCollisionAvoidance(own_feat_dim=64,neigh_feat_dim=64,embed_dim=64,)
 
         # Actor 头部网络：将拼接后的 128 维特征 (64本船 + 64威胁摘要) 映射到 256 维隐藏层
@@ -212,7 +282,7 @@ class MAPPOActor(nn.Module):
         """
         将原始观测张量拆分为本船观测和邻居观测。
 
-        观测布局：[own_obs (63维) | neigh_0 (10维) | neigh_1 (10维) | neigh_2 (10维)]
+        观测布局：[own_obs | neigh_0 | ... | neigh_n]，各段由 ObservationSpec 定义。
 
         Parameters
         ----------
@@ -222,12 +292,12 @@ class MAPPOActor(nn.Module):
         Returns
         -------
         own_obs : torch.Tensor
-            本船观测，shape=(..., 63)。
+            本船观测，shape=(..., observation_spec.own_dim)。
         neighbors_obs : torch.Tensor
-            邻居观测，shape=(..., neighbor_count=3, neighbor_obs_dim=10)。
+            邻居观测，shape=(..., neighbor_count, neighbor_obs_dim)。
         """
-        own_obs = obs[..., :self.own_obs_dim]
-        neigh_flat = obs[..., self.own_obs_dim:]
+        own_obs = obs[..., self.observation_spec.own_slice]
+        neigh_flat = obs[..., self.observation_spec.neighbor_slice]
         neighbors_obs = neigh_flat.reshape(
             *obs.shape[:-1], self.neighbor_count, self.neighbor_obs_dim
         )
@@ -374,4 +444,202 @@ class MAPPOActor(nn.Module):
         """
         dist = self._dist(obs)
         return dist.log_prob(action), dist.entropy()
-        
+
+
+class TransformerMAPPOActor(nn.Module):
+    """去中心化 Actor：对本船历史帧做 Transformer，邻居仍用 Attention。"""
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        *,
+        hist_len: int | None = None,
+        observation_spec: ObservationSpec | Mapping[str, Any] | None = None,
+        tf_d_model: int = 64,
+        tf_nhead: int = 4,
+        tf_num_layers: int = 2,
+        tf_ffn_dim: int = 128,
+        tf_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+        self.observation_spec = _resolve_observation_spec(
+            observation_spec,
+            obs_dim=self.obs_dim,
+            hist_len=hist_len,
+        )
+        self.own_obs_dim = self.observation_spec.own_dim
+        self.neighbor_count = self.observation_spec.neighbor_count
+        self.neighbor_obs_dim = self.observation_spec.neighbor_dim
+        self.hist_len = self.observation_spec.history_len
+        self.token_dim = self.observation_spec.history_token_dim
+        self.context_dim = self.observation_spec.own_context_dim
+        self.motion_dim = self.observation_spec.motion_dim
+        self.action_hist_dim = self.observation_spec.action_history_dim
+
+        self.temporal_encoder = TemporalTransformerEncoder(
+            token_dim=self.token_dim,
+            hist_len=self.hist_len,
+            d_model=int(tf_d_model),
+            nhead=int(tf_nhead),
+            num_layers=int(tf_num_layers),
+            ffn_dim=int(tf_ffn_dim),
+            dropout=float(tf_dropout),
+            out_dim=64,
+        )
+        self.context_encoder = nn.Sequential(
+            nn.Linear(self.context_dim, 64),
+            nn.LayerNorm(64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+        )
+        self.own_fuse = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.Tanh(),
+        )
+        self.neigh_encoder = nn.Sequential(
+            nn.Linear(self.neighbor_obs_dim, 64),
+            nn.LayerNorm(64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+        )
+        self.attention_block = AttentionCollisionAvoidance(
+            own_feat_dim=64, neigh_feat_dim=64, embed_dim=64
+        )
+        self.actor_head = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.LayerNorm(256),
+            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.Tanh(),
+        )
+        self.policy_mean = nn.Linear(256, action_dim)
+        self.log_std = nn.Parameter(torch.full((action_dim,), _LOG_STD_INIT))
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in (
+            self.context_encoder,
+            self.own_fuse,
+            self.neigh_encoder,
+            self.attention_block,
+            self.actor_head,
+        ):
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight, gain=math.sqrt(2.0))
+                    nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.policy_mean.weight, gain=0.1)
+        nn.init.zeros_(self.policy_mean.bias)
+
+    def _split_obs(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        own_obs = obs[..., self.observation_spec.own_slice]
+        neigh_flat = obs[..., self.observation_spec.neighbor_slice]
+        neighbors_obs = neigh_flat.reshape(
+            *obs.shape[:-1], self.neighbor_count, self.neighbor_obs_dim
+        )
+        return own_obs, neighbors_obs
+
+    def _own_history_tokens_and_context(
+        self, own_obs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """own → (tokens K×10, context)。观测布局为全部 motion 再全部 action。"""
+        motion = own_obs[..., self.observation_spec.motion_history_slice].reshape(
+            *own_obs.shape[:-1], self.hist_len, self.motion_dim
+        )
+        action = own_obs[..., self.observation_spec.action_history_slice].reshape(
+            *own_obs.shape[:-1], self.hist_len, self.action_hist_dim
+        )
+        tokens = torch.cat([motion, action], dim=-1)
+        context = own_obs[..., self.observation_spec.action_history_slice.stop :]
+        if context.shape[-1] != self.context_dim:
+            raise ValueError(
+                f"expected context_dim={self.context_dim}, got {context.shape[-1]}"
+            )
+        return tokens, context
+
+    def _features(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        leading_shape = obs.shape[:-1]
+        flat_obs = obs.reshape(-1, self.obs_dim)
+        own_obs, neighbors_obs = self._split_obs(flat_obs)
+        tokens, context = self._own_history_tokens_and_context(own_obs)
+        e_temporal = self.temporal_encoder(tokens)
+        e_context = self.context_encoder(context)
+        e_own = self.own_fuse(torch.cat([e_temporal, e_context], dim=-1))
+        n = self.neighbor_count
+        e_neigh = self.neigh_encoder(
+            neighbors_obs.reshape(-1, self.neighbor_obs_dim)
+        ).reshape(-1, n, self.attention_block.embed_dim)
+        env_threat_feat, weights = self.attention_block(e_own, e_neigh)
+        combined = torch.cat([e_own, env_threat_feat], dim=-1)
+        return combined.reshape(*leading_shape, -1), weights.reshape(*leading_shape, n)
+
+    def policy(self, obs: torch.Tensor) -> torch.Tensor:
+        features, _ = self._features(obs)
+        return self.policy_mean(self.actor_head(features))
+
+    def attention_weights(self, obs: torch.Tensor) -> torch.Tensor:
+        _, weights = self._features(obs)
+        return weights
+
+    def _dist(self, obs: torch.Tensor) -> SquashedDiagonalGaussian:
+        return SquashedDiagonalGaussian(self.policy(obs), self.log_std)
+
+    def act(
+        self, obs: torch.Tensor, deterministic: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        dist = self._dist(obs)
+        action, logprob, _ = dist.sample(deterministic=deterministic)
+        return action, logprob, None
+
+    def evaluate_actions(
+        self, obs: torch.Tensor, action: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dist = self._dist(obs)
+        return dist.log_prob(action), dist.entropy()
+
+
+def build_actor(
+    arch: str,
+    obs_dim: int,
+    action_dim: int,
+    observation_spec: ObservationSpec | Mapping[str, Any] | None = None,
+    **arch_kwargs: Any,
+) -> nn.Module:
+    """按架构名构造 Actor；gru/lstm 预留接口。"""
+    name = str(arch).strip().lower()
+    if name == "mlp":
+        return MAPPOActor(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            observation_spec=observation_spec,
+        )
+    if name == "transformer":
+        tf_keys = (
+            "hist_len",
+            "tf_d_model",
+            "tf_nhead",
+            "tf_num_layers",
+            "tf_ffn_dim",
+            "tf_dropout",
+        )
+        kwargs = {k: arch_kwargs[k] for k in tf_keys if k in arch_kwargs}
+        return TransformerMAPPOActor(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            observation_spec=observation_spec,
+            **kwargs,
+        )
+    if name in ("gru", "lstm"):
+        raise NotImplementedError(
+            f"actor_arch={name!r} is reserved for the ablation study but not implemented yet"
+        )
+    raise ValueError(
+        f"unknown actor_arch={arch!r}; expected one of: mlp, transformer, gru, lstm"
+    )

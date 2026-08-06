@@ -28,23 +28,24 @@ def _park_unused_tugs(env: FormationEnv) -> None:
 
 
 def test_tug_cpa_penalizes_future_head_on_close_approach() -> None:
+    """Outside tug-safe radius, head-on closing still raises p_tug_collision via CPA."""
     env = _make_env()
     env.ship.x = 0.0
     env.ship.y = 1000.0
     env.ship.u = 0.0
     env.ship.v = 0.0
 
-    env.tugs[0].eta = Vec3(-50.0, 0.0, 0.0)
-    env.tugs[0].nu = Vec3(1.0, 0.0, 0.0)
-    env.tugs[1].eta = Vec3(50.0, 0.0, 0.0)
-    env.tugs[1].nu = Vec3(-1.0, 0.0, 0.0)
+    # Pair distance 140 m > tug_safe (120 m); closing at 4 m/s → tcpa=35 s < horizon.
+    env.tugs[0].eta = Vec3(-70.0, 0.0, 0.0)
+    env.tugs[0].nu = Vec3(2.0, 0.0, 0.0)
+    env.tugs[1].eta = Vec3(70.0, 0.0, 0.0)
+    env.tugs[1].nu = Vec3(-2.0, 0.0, 0.0)
     _park_unused_tugs(env)
 
     comp = _compute_reward_components(env)
 
-    assert comp["p_tug_cpa"][0] > 0.0
-    assert comp["p_tug_cpa"][1] > 0.0
-    assert comp["p_cpa_collision"][0] > 0.0
+    assert float(comp["p_tug_collision"][0]) > 0.0
+    assert float(comp["p_tug_collision"][1]) > 0.0
     assert np.isfinite(comp["p_collision"]).all()
 
 
@@ -55,16 +56,16 @@ def test_tug_cpa_ignores_separating_motion() -> None:
     env.ship.u = 0.0
     env.ship.v = 0.0
 
-    env.tugs[0].eta = Vec3(-50.0, 0.0, 0.0)
-    env.tugs[0].nu = Vec3(-1.0, 0.0, 0.0)
-    env.tugs[1].eta = Vec3(50.0, 0.0, 0.0)
-    env.tugs[1].nu = Vec3(1.0, 0.0, 0.0)
+    env.tugs[0].eta = Vec3(-70.0, 0.0, 0.0)
+    env.tugs[0].nu = Vec3(-2.0, 0.0, 0.0)
+    env.tugs[1].eta = Vec3(70.0, 0.0, 0.0)
+    env.tugs[1].nu = Vec3(2.0, 0.0, 0.0)
     _park_unused_tugs(env)
 
     comp = _compute_reward_components(env)
 
-    assert comp["p_tug_cpa"][0] == 0.0
-    assert comp["p_tug_cpa"][1] == 0.0
+    assert float(comp["p_tug_collision"][0]) == 0.0
+    assert float(comp["p_tug_collision"][1]) == 0.0
 
 
 def test_ship_cpa_uses_future_hull_distance() -> None:
@@ -76,8 +77,9 @@ def test_ship_cpa_uses_future_hull_distance() -> None:
     env.ship.v = 0.0
     env.ship.r = 0.0
 
-    env.tugs[0].eta = Vec3(0.0, 80.0, 0.0)
-    env.tugs[0].nu = Vec3(0.0, -2.0, 0.0)
+    # Hull distance > ship_safe (100 m); closing fast enough for tcpa within horizon.
+    env.tugs[0].eta = Vec3(0.0, 130.0, 0.0)
+    env.tugs[0].nu = Vec3(0.0, -3.0, 0.0)
     env.tugs[1].eta = Vec3(400.0, 400.0, 0.0)
     env.tugs[1].nu = Vec3.zero()
     _park_unused_tugs(env)
@@ -87,6 +89,5 @@ def test_ship_cpa_uses_future_hull_distance() -> None:
     assert env.ship.distance_from_hull(env.tugs[0].eta.x, env.tugs[0].eta.y) > (
         env.cfg.reward_collision_ship_safe_m
     )
-    assert comp["p_ship_cpa"][0] > 0.0
-    assert comp["min_tcpa"][0] < env.cfg.reward_cpa_horizon_s
+    assert float(comp["p_ship_collision"][0]) > 0.0
     assert np.isfinite(comp["p_collision"]).all()
