@@ -70,6 +70,8 @@ def test_tug_cpa_ignores_separating_motion() -> None:
 
 def test_ship_cpa_uses_future_hull_distance() -> None:
     env = _make_env()
+    # Keep this case's geometry vs an explicit ship_safe=100 (default is now 80).
+    env.cfg.reward_collision_ship_safe_m = 100.0
     env.ship.x = 0.0
     env.ship.y = 0.0
     env.ship.psi = 0.0
@@ -77,7 +79,7 @@ def test_ship_cpa_uses_future_hull_distance() -> None:
     env.ship.v = 0.0
     env.ship.r = 0.0
 
-    # Hull distance > ship_safe (100 m); closing fast enough for tcpa within horizon.
+    # Hull distance > explicit ship_safe=100; closing fast enough for tcpa within horizon.
     env.tugs[0].eta = Vec3(0.0, 130.0, 0.0)
     env.tugs[0].nu = Vec3(0.0, -3.0, 0.0)
     env.tugs[1].eta = Vec3(400.0, 400.0, 0.0)

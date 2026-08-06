@@ -46,24 +46,37 @@ class EnvConfig:
     ship_collision_dist_m: float = 6.0
 
     # ---------- 奖励 ----------
-    # R = w_dist*R_dist + w_hold*R_hold + w_vel*R_vel - w_coll*P_coll + R_shape
+    # R = w_dist*R_dist + w_hold*R_hold + w_vel*R_vel - w_coll*P_coll
+    #     - w_stall*P_stall + R_shape + R_team
     reward_dist_w: float = 3.0
     reward_hold_w: float = 2.0
     reward_velocity_w: float = 0.0
     reward_collision_w: float = 1.0
     reward_collision_cap: float = 2.0
+    reward_stall_w: float = 0.5
 
     # 距离
     reward_dist_progress_clip_m: float = 5.0
+    reward_dist_progress_frac: float = 0.7
     reward_dist_scale_m: float = 500.0
     reward_hold_start_m: float = 150.0
     reward_hold_full_m: float = 20.0
 
     # 碰撞
-    reward_collision_ship_safe_m: float = 100.0
+    reward_collision_ship_safe_m: float = 80.0
     reward_collision_tug_safe_m: float = 120.0
     reward_cpa_horizon_s: float = 60.0
     reward_collision_cpa_w: float = 2.0
+
+    # 进槽走廊软化（仅船软碰）
+    reward_corridor_half_width_m: float = 40.0
+    reward_corridor_axial_slack_m: float = 30.0
+    reward_ship_soft_min_scale: float = 0.15
+
+    # 停滞（防外围刷分）
+    reward_stall_window_s: float = 5.0
+    reward_stall_min_progress_m: float = 2.0
+    reward_stall_floor: float = 0.2
 
     # 势函数 shaping
     reward_shape_w: float = 0.3
