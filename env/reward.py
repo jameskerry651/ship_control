@@ -146,8 +146,15 @@ class FormationRewardComputer:
         w_hold = float(getattr(cfg, "reward_hold_w", 1.0))
         w_vel = float(getattr(cfg, "reward_velocity_w", 0.25))
         w_coll = float(getattr(cfg, "reward_collision_w", 3.0))
+        w_stall = float(getattr(cfg, "reward_stall_w", 0.0))
         collision_cap = float(getattr(cfg, "reward_collision_cap", 1.5))
         progress_clip = max(float(getattr(cfg, "reward_dist_progress_clip_m", 2.0)), 1e-6)
+        dist_progress_frac = float(np.clip(getattr(cfg, "reward_dist_progress_frac", 0.7), 0.0, 1.0))
+        stall_window_s = max(float(getattr(cfg, "reward_stall_window_s", 5.0)), 0.0)
+        stall_min_progress_m = max(float(getattr(cfg, "reward_stall_min_progress_m", 2.0)), 1e-6)
+        stall_floor = float(np.clip(getattr(cfg, "reward_stall_floor", 0.2), 0.0, 1.0))
+        dt_ctrl = max(float(getattr(cfg, "dt_ctrl", 0.2)), 1e-6)
+        stall_steps = max(1, int(math.ceil(stall_window_s / dt_ctrl))) if stall_window_s > 0.0 else 0
         hold_start_m = max(float(getattr(cfg, "reward_hold_start_m", 120.0)), 1e-6)
         hold_full_m = max(float(getattr(cfg, "reward_hold_full_m", 20.0)), 1e-6)
         if hold_start_m < hold_full_m:
@@ -211,11 +218,27 @@ class FormationRewardComputer:
             z_in_zone[i] = pos_score * head_score * speed_score
 
             # -- reward components --
-            # 混合：进度奖励 + 绝对距离奖励（越近越好）
+            # 混合：进度为主 + 弱绝对距离；再乘停滞缩放
             dist_bonus = 1.0 - d / max(float(getattr(cfg, "reward_dist_scale_m", 500.0)), 1e-6)
             dist_bonus = float(np.clip(dist_bonus, -0.5, 1.0))
-            r_dist = (1.0 - gate) * (0.4 * progress + 0.6 * dist_bonus)
+            r_dist = (1.0 - gate) * (
+                dist_progress_frac * progress + (1.0 - dist_progress_frac) * dist_bonus
+            )
             r_hold = gate * hold_score
+
+            stall_scale = 1.0
+            p_stall = 0.0
+            if gate < 0.99 and stall_steps > 0 and int(getattr(episode, "dist_hist_filled", 0)) >= stall_steps:
+                hist = episode.dist_hist
+                head = int(episode.dist_hist_head)
+                cap = int(hist.shape[1])
+                idx = (head - stall_steps) % cap
+                d_old = float(hist[i, idx])
+                delta = d_old - d
+                if delta < stall_min_progress_m:
+                    p_stall = float(np.clip((stall_min_progress_m - delta) / stall_min_progress_m, 0.0, 1.0))
+                    stall_scale = 1.0 - (1.0 - stall_floor) * p_stall
+            r_dist = r_dist * stall_scale
 
             speed_pen = 1.0 - math.exp(-((speed_err / speed_scale) ** 2))
             yaw_err = abs(tug.r - state.ship.r)
@@ -279,7 +302,14 @@ class FormationRewardComputer:
                 r_shape = w_shape * float(np.clip(shape_gamma * phi_cur - phi_prev, -shape_clip, shape_clip))
 
             # -- total --
-            r_total = w_dist * r_dist + w_hold * r_hold + w_vel * r_vel - w_coll * p_coll + r_shape
+            r_total = (
+                w_dist * r_dist
+                + w_hold * r_hold
+                + w_vel * r_vel
+                - w_coll * p_coll
+                - w_stall * p_stall
+                + r_shape
+            )
             rewards[i] = r_total
 
             # -- in-zone step tracking --
@@ -297,6 +327,8 @@ class FormationRewardComputer:
             comp["p_collision"][i] = p_coll
             comp["p_ship_collision"][i] = p_ship
             comp["p_tug_collision"][i] = p_tug
+            comp["p_stall"][i] = p_stall
+            comp["stall_scale"][i] = stall_scale
             comp["dist_to_slot"][i] = d
             comp["heading_err_deg"][i] = math.degrees(abs(dpsi))
             comp["speed_err"][i] = speed_err
