@@ -87,7 +87,7 @@ tensorboard --logdir runs
 1. `eval/success_rate`、`eval/capture_rate`、`eval/collision_rate`、`eval/final_dist_mean`
 2. 对照 `rollout/` 是否同向（噪声更大）
 3. `loss/explained_variance`、`loss/approx_kl`、`loss/entropy` 看训练是否健康
-4. `reward/r_dist`、`reward/r_hold`、`reward/p_collision` 看卡在接近、跟随还是避碰
+4. `reward/r_dist`、`reward/r_hold`、`reward/p_collision`、`reward/p_stall` 看卡在接近、跟随、避碰还是外围停滞
 
 ---
 
