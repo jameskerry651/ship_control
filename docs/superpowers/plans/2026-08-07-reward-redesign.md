@@ -521,7 +521,7 @@ _TB_REWARD_KEYS = ("r_dist", "r_hold", "p_collision", "p_stall")
 
 - [ ] **Step 2: Rewrite docs/reward_function.md dense-reward sections**
 
-更新第 1 节总式（含 \(P_{\mathrm{stall}}\)）；第 2 节写 \(\alpha\) 与 `stall_scale`；新增「走廊软化」与「停滞」小节；配置表加入 Task 1 全部新字段；诊断表加入 `p_stall` / `corridor_gate` / `ship_soft_scale` / `stall_scale`；注明 `ship_safe` 默认 80。保留指向 preset 文档的链接，并注明旧 preset 语义可能过时。
+更新第 1 节总式（含 \(P_{\mathrm{stall}}\)）；第 2 节写 \(\alpha\) 与 `stall_scale`；新增「走廊软化」与「停滞」小节；配置表加入 Task 1 全部新字段；诊断表加入 `p_stall` / `corridor_gate` / `ship_soft_scale` / `stall_scale`；注明 `ship_safe` 默认 80。Preset 节改为说明 `REWARD_PRESETS` 空骨架与 `--reward-preset` 接口。
 
 - [ ] **Step 3: Update tensorboard_metrics.md if it enumerates reward/* keys**
 

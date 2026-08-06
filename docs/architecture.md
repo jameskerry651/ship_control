@@ -16,11 +16,10 @@
 
 ```
 scripts/          train.py · visualize.py · export_maneuver_videos.py
-                  · run_reward_preset_ablation.py · summarize_reward_presets.py
 rl/               Actor / Critic / PPO / temporal
 env/              FormationEnv · Observer · Reward · init · obs_spec · state
 physics/          TugboatDynamicsModel · LargeShipModel
-config.py         EnvConfig · PPOConfig · VizConfig · REWARD_PRESETS
+config.py         EnvConfig · PPOConfig · VizConfig · REWARD_PRESETS（骨架）
 simulator/        独立手动仿真（仅依赖 physics）
 ```
 
@@ -39,7 +38,8 @@ simulator → physics only
 
 `FormationEnv` 组合：
 
-- `sample_tug_init_states`（`init.py`）：圆环初始化 `tug_init_mode=circle`，默认半径 `tug_init_radius_m=100`（可用 `--init-radius` 覆盖）
+- `sample_tug_init_states`（`init.py`）：安全圆环初始化 `tug_init_schema=safe_circle_v2`，默认半径 `tug_init_radius_m=120`；随机顺序逐艇拒绝采样保证船体间隙和艇间距，失败时显式报错
+- `assign_tugs_to_slots`（`init.py`）：默认 minimax 唯一匹配，优先降低最远单艇初始距离；匹配后按 slot 规范化 agent 顺序，从而保持 canonical critic 的固定角色语义；`fixed` 模式用于旧实验复现
 - `Observer`：局部观测与 global state
 - `FormationRewardComputer`：稠密奖励
 - `ObservationSpec`（`obs_spec.py`）：观测维度单一真相源（默认 **93** 维 / agent）
@@ -77,11 +77,12 @@ simulator → physics only
 
 ## 5. 训练入口 `scripts/train.py`
 
-- 向量化：`sync` / `subproc`
+- 向量化：默认 `subproc` + `num_envs=16`（可用 `--env-backend sync` 覆盖）
+- 设备：默认 `cuda`；评估默认 `eval_workers=1`（CUDA 下并行 eval 用 spawn+CPU，显式加大时可用）
 - 奖励 RunningMeanStd 归一化（稠密）+ 终端奖罚原尺度叠加
 - TensorBoard 核心曲线（见 [tensorboard_metrics.md](tensorboard_metrics.md)）
 - 按 eval `success_rate` 优先存 `best.pt`；定期 `last.pt`
-- CLI：`--arch`、`--init-radius`、`--reward-preset`（见 [arch_ablation.md](arch_ablation.md) / [reward_presets.md](reward_presets.md)）
+- CLI：`--arch`、`--init-radius`、`--reward-preset`（见 [arch_ablation.md](arch_ablation.md)；preset 映射见 `config.REWARD_PRESETS`）
 
 ## 6. 测试（与文档相关）
 
@@ -92,6 +93,6 @@ simulator → physics only
 | `tests/test_observation_spec.py` | ObservationSpec 契约 |
 | `tests/test_attention.py` | 邻居 Attention |
 | `tests/test_init_radius.py` | init 半径配置 |
-| `tests/test_reward_presets.py` | `REWARD_PRESETS` / `apply_reward_preset` |
+| `tests/test_reward_presets.py` | `REWARD_PRESETS` 骨架 / `apply_reward_preset` |
 | `tests/test_reward_cpa.py` | CPA 风险项 |
 | `tests/test_maneuvers.py` | 动力学操纵性 |

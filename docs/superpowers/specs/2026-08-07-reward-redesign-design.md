@@ -12,7 +12,7 @@
 - 船软障默认 `reward_collision_ship_safe_m=100`，而 slot 约在船体侧 ~25 m 外，进槽路径几乎全程在软罚区；
 - `r_hold` / `capture_rate` 长期接近 0，`final_dist` 常停在 ~200 m。
 
-上一轮仅做权重/几何 preset 消融（见 `2026-08-06-reward-preset-ablation-design.md`），若仍躲远刷 return，则需结构项。本轮做结构性重设计。
+上一轮权重/几何 preset 消融未能打破「躲远刷 return」；本轮做结构性重设计（该消融协议与 `rw_*` 表已移除）。
 
 **成功标准（同时满足，相对「躲远刷分」基线，同 `init_radius=100` + transformer、可比步数）：**
 
@@ -145,7 +145,7 @@ R_{\mathrm{dist}}
 
 未列出的奖励字段保持现默认（`reward_dist_w=3`、`reward_hold_w=2`、`reward_collision_w=1`、`reward_shape_w=0.3`、`reward_team_w=0.2` 等）。
 
-旧 `REWARD_PRESETS` 仍可加载，但语义可能过时；本轮不强制改消融表，实现后另开筛选协议。
+旧 `rw_*` preset 消融表已清空；保留 `REWARD_PRESETS` / `--reward-preset` 骨架，待新筛选协议注册。
 
 ## 7. 诊断字段
 

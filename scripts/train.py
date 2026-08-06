@@ -1,7 +1,7 @@
 """MAPPO 多智能体拖轮编队训练脚本。
 
 用法：
-    python scripts/train.py --total-steps 5000000 --num-envs 8 --rollout-steps 256
+    python scripts/train.py --total-steps 5000000 --num-envs 16 --device cuda
 
 特性：
 - 去中心化 actor：每艘拖轮只看自己的局部观察
@@ -667,18 +667,18 @@ def evaluate_policy(
             for i in range(n_episodes)
         ]
     else:
-        state_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        # 并行 eval 固定 CPU + spawn：父进程已 init CUDA 后再 fork，子进程即使用 CPU 也会挂死。
+        state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         tasks = [
-            (seed + i, env_cfg, state_cpu, model_kwargs, str(device))
+            (seed + i, env_cfg, state_cpu, model_kwargs, "cpu")
             for i in range(n_episodes)
         ]
-        # macOS 上 spawn 多次创建/销毁子进程会导致死锁，显式用 fork context。
-        ctx = get_context("fork")
+        ctx = get_context("spawn")
         results = []
         try:
             with ProcessPoolExecutor(max_workers=eval_workers, mp_context=ctx) as pool:
                 results = list(pool.map(_run_eval_episode_task, tasks, chunksize=1))
-        except BrokenExecutor as exc:
+        except (BrokenExecutor, Exception) as exc:
             print(f"[eval-warn] parallel eval failed ({exc}); retrying with 1 worker.")
             eval_model = MAPPOActorCritic(**model_kwargs)
             eval_model.load_state_dict(model.state_dict())
@@ -745,7 +745,14 @@ def main() -> None:
         "--init-radius",
         type=float,
         default=None,
-        help="覆盖 EnvConfig.tug_init_radius_m（默认 100；远距复现可用 200）",
+        help="覆盖 EnvConfig.tug_init_radius_m（默认安全半径 120；远距复现可用 200）",
+    )
+    parser.add_argument(
+        "--slot-assignment",
+        type=str,
+        default=None,
+        choices=["minimax", "fixed"],
+        help="reset 后的 tug→slot 分配（默认 minimax；fixed 用于旧实验复现）",
     )
     parser.add_argument(
         "--reward-preset",
@@ -753,7 +760,11 @@ def main() -> None:
         default=None,
         help=(
             "应用奖励超参 preset（config.REWARD_PRESETS）；"
-            f"可选: {', '.join(list_reward_presets())}"
+            + (
+                f"可选: {', '.join(list_reward_presets())}"
+                if list_reward_presets()
+                else "当前无已注册 preset，可在 config.REWARD_PRESETS 中添加"
+            )
         ),
     )
     parser.add_argument("--hold-time", type=float, default=None,
@@ -781,8 +792,8 @@ def main() -> None:
                         help="rollout 环境后端：subproc 多进程并行 step，sync 单进程顺序")
     parser.add_argument("--env-workers", type=int, default=None,
                         help="subproc 环境进程数（默认等于 --num-envs）")
-    parser.add_argument("--eval-workers", type=int, default=1,
-                        help="评估并行进程数（默认 1=顺序评估；>1 用多进程）")
+    parser.add_argument("--eval-workers", type=int, default=PPOConfig.eval_workers,
+                        help="评估并行进程数（默认 PPOConfig.eval_workers；1=顺序评估）")
     parser.add_argument("--torch-threads", type=int, default=0,
                         help="PyTorch CPU 算子线程数，0 表示不修改默认")
     args = parser.parse_args()
@@ -797,6 +808,8 @@ def main() -> None:
         env_cfg.tug_init_mode = args.init_mode
     if args.init_radius is not None:
         env_cfg.tug_init_radius_m = float(args.init_radius)
+    if args.slot_assignment is not None:
+        env_cfg.tug_slot_assignment_mode = str(args.slot_assignment)
     if args.hold_time is not None:
         env_cfg.hold_time_s = float(args.hold_time)
     if args.pos_tol is not None:
@@ -849,7 +862,11 @@ def main() -> None:
     print(f"[init] device   = {device}")
     print(
         f"[init] init_mode = {env_cfg.tug_init_mode}, "
+        f"schema={env_cfg.tug_init_schema}, "
         f"init_radius_m={env_cfg.tug_init_radius_m:.1f}, "
+        f"slot_assignment={env_cfg.tug_slot_assignment_mode}, "
+        f"ship_margin_m={env_cfg.tug_init_ship_margin_m:.1f}, "
+        f"pair_margin_m={env_cfg.tug_init_pair_margin_m:.1f}, "
         f"obs_history_k={env_cfg.obs_history_k}, "
         f"ship_preview_times={env_cfg.obs_ship_preview_times_s}"
     )

@@ -42,7 +42,6 @@
 - `config.py`：`PPOConfig` 上述字段与注释
 - `README.md`：默认训练说明中的 env / eval 默认
 - `docs/architecture.md`：向量化与 eval 默认描述
-- `scripts/run_reward_preset_ablation.py`、`docs/reward_presets.md`：文案中的默认 `num_envs=16` 同步为 32（CLI 仍可覆盖）
 
 **明确不做**
 

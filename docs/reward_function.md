@@ -180,6 +180,6 @@ e_v < \texttt{speed\_tol\_ms}
 
 TensorBoard 默认记录 `r_dist`、`r_hold`、`p_collision`、`p_stall`（见 [tensorboard_metrics.md](tensorboard_metrics.md)）。
 
-## Preset 消融
+## Preset 接口
 
-旧超参组合见 [reward_presets.md](reward_presets.md)（`--reward-preset`）。结构性重设计后，部分 preset 语义可能过时，需另开筛选协议。
+训练 CLI 保留 `--reward-preset`，映射表为 `config.REWARD_PRESETS`（当前为空骨架）。新一轮超参筛选在此注册后再写实验协议。

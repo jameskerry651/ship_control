@@ -28,7 +28,7 @@ import numpy as np
 
 from config import EnvConfig
 from env.obs_spec import _GLOBAL_ACCEL_PER_TUG_DIM, _GLOBAL_PER_TUG_DIM, _GLOBAL_SHIP_DIM, _SHIP_LINEAR_ACCEL_SCALE, _TUG_LINEAR_ACCEL_SCALE, _TUG_YAW_ACCEL_SCALE
-from physics.large_ship_model import _wrap_pi
+from physics.large_ship_model import _wrap_pi, distance_from_rectangular_hull_pose
 
 def _closest_hull_point_body(x_body: float, y_body: float, length_m: float, beam_m: float) -> tuple[float, float]:
     """Closest point on the rectangular collision hull in ship body coordinates."""
@@ -88,32 +88,22 @@ class ShipSnapshot:
         return c * self.u - s * self.v, s * self.u + c * self.v
 
     def distance_from_hull(self, x_world: float, y_world: float) -> float:
-        """世界坐标点到船体外廓的最近距离（内部为负值）。"""
-        dx = x_world - self.x
-        dy = y_world - self.y
-        cos_p = math.cos(self.psi)
-        sin_p = math.sin(self.psi)
-        x_b = cos_p * dx + sin_p * dy
-        y_b = -sin_p * dx + cos_p * dy
-        l_half = self.length_m / 2.0
-        b_half = self.beam_m / 2.0
-        ex = max(abs(x_b) - l_half, 0.0)
-        ey = max(abs(y_b) - b_half, 0.0)
-        return math.hypot(ex, ey)
+        """世界坐标点到船体外廓的最近外部距离（内部为 0）。"""
+        return distance_from_rectangular_hull_pose(
+            x_world, y_world, self.x, self.y, self.psi, self.length_m, self.beam_m
+        )
 
     def distance_from_hull_pose(self, x_world: float, y_world: float, ship_x: float, ship_y: float, ship_psi: float) -> float:
         """给定大船位姿下，世界坐标点到船体外廓的最近距离。"""
-        dx = x_world - ship_x
-        dy = y_world - ship_y
-        cos_p = math.cos(ship_psi)
-        sin_p = math.sin(ship_psi)
-        x_b = cos_p * dx + sin_p * dy
-        y_b = -sin_p * dx + cos_p * dy
-        l_half = self.length_m / 2.0
-        b_half = self.beam_m / 2.0
-        ex = max(abs(x_b) - l_half, 0.0)
-        ey = max(abs(y_b) - b_half, 0.0)
-        return math.hypot(ex, ey)
+        return distance_from_rectangular_hull_pose(
+            x_world,
+            y_world,
+            ship_x,
+            ship_y,
+            ship_psi,
+            self.length_m,
+            self.beam_m,
+        )
 
     def slot_positions_body(self) -> np.ndarray:
         """返回 4 个 slot 在船体坐标系下的位置 (4, 2)。"""

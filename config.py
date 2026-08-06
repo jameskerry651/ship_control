@@ -28,9 +28,14 @@ class EnvConfig:
     slot_lon_offset_m: float = 20.0
     slot_lat_offset_m: float = 25.0
 
-    # 初始化（圆环半径；远距复现可用 --init-radius 200）
+    # 初始化（安全圆环；显式使用过小半径时会条件采样并警告方向偏差）
     tug_init_mode: str = "circle"
-    tug_init_radius_m: float = 100.0
+    tug_init_schema: str = "safe_circle_v2"
+    tug_init_radius_m: float = 120.0
+    tug_init_ship_margin_m: float = 5.0
+    tug_init_pair_margin_m: float = 5.0
+    tug_init_max_attempts: int = 1000
+    tug_slot_assignment_mode: str = "minimax"
 
     # 到位判定（Capture）与持续跟随（Track）
     # Capture：全体同时 in-zone 满 hold_time_s → 发捕获奖励，进入 Track，不结束
@@ -99,20 +104,8 @@ class EnvConfig:
     obs_ship_preview_times_s: tuple[float, float, float] = (5.0, 10.0, 15.0)
 
 
-REWARD_PRESETS: dict[str, dict[str, float]] = {
-    "rw_baseline": {},
-    "rw_dist_up": {"reward_dist_w": 6.0},
-    "rw_ship_safe_dn": {"reward_collision_ship_safe_m": 60.0},
-    "rw_coll_soft": {
-        "reward_collision_w": 0.5,
-        "reward_collision_cpa_w": 1.0,
-    },
-    "rw_shape_up": {"reward_shape_w": 0.8},
-    "rw_combo": {
-        "reward_dist_w": 6.0,
-        "reward_collision_ship_safe_m": 60.0,
-    },
-}
+# 奖励超参 preset 骨架：旧 rw_* 消融已移除；新筛选协议在此注册 id → 字段覆盖。
+REWARD_PRESETS: dict[str, dict[str, float]] = {}
 
 
 def list_reward_presets() -> list[str]:
@@ -126,7 +119,7 @@ def apply_reward_preset(env_cfg: EnvConfig, preset_id: str | None) -> str | None
     if not key:
         return None
     if key not in REWARD_PRESETS:
-        known = ", ".join(list_reward_presets())
+        known = ", ".join(list_reward_presets()) or "(none defined)"
         raise ValueError(f"Unknown reward preset {key!r}. Known: {known}")
     for field_name, value in REWARD_PRESETS[key].items():
         setattr(env_cfg, field_name, value)
@@ -146,8 +139,9 @@ class PPOConfig:
     target_kl: float = 0.015
 
     rollout_steps: int = 512
-    num_envs: int = 8
-    minibatch_size: int = 1024
+    # 默认面向多核 CPU + CUDA GPU（如 RTX 3090）；弱机器可用 CLI 下调
+    num_envs: int = 16
+    minibatch_size: int = 2048
     update_epochs: int = 4
 
     learning_rate: float = 1e-4
@@ -164,10 +158,13 @@ class PPOConfig:
     tf_dropout: float = 0.0
 
     log_interval: int = 1
-    save_interval: int = 25
-    eval_interval: int = 10
+    # num_envs=16 后每 update 样本量更大；收紧间隔以保持与旧 8-env 相近的评估/存盘密度
+    save_interval: int = 5
+    eval_interval: int = 2
     eval_episodes: int = 64
-    device: str = "cpu"
+    # CUDA 训练后 fork 子进程易挂死；并行 eval 需 spawn+CPU（见 train.py）。默认 1 最稳。
+    eval_workers: int = 1
+    device: str = "cuda"
     seed: int = 42
 
 

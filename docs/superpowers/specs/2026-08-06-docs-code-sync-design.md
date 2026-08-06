@@ -1,7 +1,7 @@
 # Design: 文档与代码全面对齐（清扫过时内容）
 
 **Date:** 2026-08-06  
-**Status:** Approved for planning  
+**Status:** Completed (historical); reward `rw_*` ablation docs removed in a later cleanup  
 **Approach:** 手术式对齐（删死代码 + 文档按真相源修订）
 
 ## 1. Goal
@@ -72,7 +72,6 @@
 | `docs/task_spec.md` | 保持 Approach→Capture→Track；去掉多余「旧默认 200 m」叙事若与主路径无关可压缩为一句远距复现说明 |
 | `docs/observation_space.md` | 与 `ObservationSpec` 一致；可保留 schema v1→v2 迁移注记（仍描述现有 93 维布局）；删除任何航路/waypoint 观测描述（若有） |
 | `docs/reward_function.md` | 与 `FormationRewardComputer` / `EnvConfig` 一致；无 precision/route 项 |
-| `docs/reward_presets.md` | 与 `REWARD_PRESETS` 及 `run_reward_preset_ablation.py` 一致 |
 | `docs/arch_ablation.md` | 与 `--arch` / `build_actor` 一致 |
 | `docs/tensorboard_metrics.md` | 与当前 `train.py` 写入的标量一致；去掉对 `course` 文本面板的现行描述（可一句说明旧 run 可能含历史标签） |
 
@@ -80,11 +79,10 @@
 
 | Path | Action |
 |------|--------|
-| `docs/superpowers/specs/2026-08-06-reward-preset-ablation-design.md` | **Keep**（对应现有 preset 实现） |
-| `docs/superpowers/plans/2026-08-06-reward-preset-ablation.md` | **Keep**；若仍写「after course」等过时顺序，改为当前 CLI 覆盖顺序（init-radius / tol / reward-preset） |
-| 其它无对应代码的 superpowers 文档 | 删除（当前目录仅上述两份 + 本设计） |
+| 奖励 `rw_*` preset 消融 design/plan | **已删除**（结构性重设计后清空） |
+| 其它无对应代码的 superpowers 文档 | 删除 |
 
-主文档索引（README）**不**强制链接 `docs/superpowers/`；实验协议以 `reward_presets.md` / `arch_ablation.md` 为准。
+主文档索引（README）**不**强制链接 `docs/superpowers/`；架构消融协议见 `arch_ablation.md`；奖励 preset 映射见 `config.REWARD_PRESETS`。
 
 ## 6. Out of scope
 

@@ -23,6 +23,27 @@ def _wrap_pi(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def distance_from_rectangular_hull_pose(
+    x_world: float,
+    y_world: float,
+    ship_x: float,
+    ship_y: float,
+    ship_psi: float,
+    length_m: float,
+    beam_m: float,
+) -> float:
+    """世界坐标点到给定位姿矩形船体的外部距离，点在内部时为 0。"""
+    dx = x_world - ship_x
+    dy = y_world - ship_y
+    cos_p = math.cos(ship_psi)
+    sin_p = math.sin(ship_psi)
+    x_b = cos_p * dx + sin_p * dy
+    y_b = -sin_p * dx + cos_p * dy
+    ex = max(abs(x_b) - length_m / 2.0, 0.0)
+    ey = max(abs(y_b) - beam_m / 2.0, 0.0)
+    return math.hypot(ex, ey)
+
+
 @dataclass
 class LargeShipModel:
     # 主尺度
@@ -168,15 +189,12 @@ class LargeShipModel:
 
     # 任意点到大船船体外表面的最短距离（点在船体内时返回 0）
     def distance_from_hull(self, x_world: float, y_world: float) -> float:
-        # 把世界点旋转到船体系，再用 box-outside-distance 公式
-        dx = x_world - self.x
-        dy = y_world - self.y
-        cos_p = math.cos(self.psi)
-        sin_p = math.sin(self.psi)
-        x_b = cos_p * dx + sin_p * dy
-        y_b = -sin_p * dx + cos_p * dy
-        L = self.length_m / 2.0
-        B = self.beam_m / 2.0
-        ex = max(abs(x_b) - L, 0.0)
-        ey = max(abs(y_b) - B, 0.0)
-        return math.hypot(ex, ey)
+        return distance_from_rectangular_hull_pose(
+            x_world,
+            y_world,
+            self.x,
+            self.y,
+            self.psi,
+            self.length_m,
+            self.beam_m,
+        )

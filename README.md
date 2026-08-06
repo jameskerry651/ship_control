@@ -20,7 +20,6 @@
 | [docs/architecture.md](docs/architecture.md) | 系统架构与模块依赖 |
 | [docs/observation_space.md](docs/observation_space.md) | 观测 / 全局状态 |
 | [docs/reward_function.md](docs/reward_function.md) | 奖励函数 |
-| [docs/reward_presets.md](docs/reward_presets.md) | 奖励超参 preset 消融 |
 | [docs/arch_ablation.md](docs/arch_ablation.md) | Actor 时序架构对比实验 |
 | [docs/tensorboard_metrics.md](docs/tensorboard_metrics.md) | TensorBoard 指标含义 |
 
@@ -34,17 +33,13 @@
 - Transformer（`--arch transformer`）
 
 ```bash
-# 默认 init 半径 100 m；远距复现加 --init-radius 200
-python scripts/train.py --arch transformer --run-name tf_r100
-python scripts/train.py --arch mlp --run-name mlp_r100
+# 默认安全 init 半径 120 m；远距复现加 --init-radius 200
+python scripts/train.py --arch transformer --run-name tf_r120
+python scripts/train.py --arch mlp --run-name mlp_r120
+# 默认按 minimax 动态分配 slot；旧固定编号实验加 --slot-assignment fixed
 ```
 
-奖励超参 preset 消融（协议见 [docs/reward_presets.md](docs/reward_presets.md)）：
-
-```bash
-python scripts/train.py --arch transformer --init-radius 100 \
-  --reward-preset rw_combo --run-name rw_combo --total-steps 1000000 --seed 42
-```
+奖励超参可用 `--reward-preset`（映射在 `config.REWARD_PRESETS`；当前为空骨架，待新筛选协议注册）。
 
 ## 目录结构
 
@@ -65,9 +60,10 @@ docs/                设计文档
 ```bash
 pip install torch numpy pygame tensorboard scipy
 
-# 训练（默认 init 半径 100 m、5M env-steps）
-python scripts/train.py --arch transformer --run-name tf_r100
+# 训练（默认 cuda + subproc + 16 envs、安全 init 半径 120 m、5M env-steps）
+python scripts/train.py --arch transformer --run-name tf_r120
 # 远距：python scripts/train.py --arch transformer --run-name tf_r200 --init-radius 200
+# 弱机器：加 --device cpu --env-backend sync --num-envs 2
 
 # TensorBoard（指标说明见 docs/tensorboard_metrics.md）
 tensorboard --logdir runs

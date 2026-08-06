@@ -1,8 +1,10 @@
 # Training Throughput Defaults Implementation Plan
 
+> **Historical note (2026-08-07):** `docs/reward_presets.md` 与 `scripts/run_reward_preset_ablation.py` 已删除；本计划中相关步骤忽略。只同步 `README` / `architecture` / `train.py` / `PPOConfig`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把 MAPPO 训练默认超参调到更高墙钟吞吐（`num_envs=32`、更大 minibatch、更轻更快的 eval），并同步文档与消融脚本默认。
+**Goal:** 把 MAPPO 训练默认超参调到更高墙钟吞吐（`num_envs=32`、更大 minibatch、更轻更快的 eval），并同步文档默认。
 
 **Architecture:** 只改 `PPOConfig` 字段默认值与引用这些默认值的文案/CLI；训练循环、网络、环境逻辑不动。用单测锁定默认值，避免文档与代码漂移。短跑验收对照设计文档中的诊断基线。
 
@@ -32,8 +34,6 @@
 | `tests/test_ppo_throughput_defaults.py` | 锁定吞吐相关默认值 |
 | `README.md` | 快速开始里的默认 env 说明 |
 | `docs/architecture.md` | 训练入口默认描述 |
-| `docs/reward_presets.md` | 消融推荐命令中的默认 `num-envs` |
-| `scripts/run_reward_preset_ablation.py` | docstring + `--num-envs` argparse 默认 |
 | `scripts/train.py` | 模块 docstring 示例中的 `--num-envs`（若仍写 16） |
 | `docs/superpowers/specs/2026-08-06-training-throughput-defaults-design.md` | 只读参考 |
 
@@ -119,18 +119,16 @@ EOF
 
 ---
 
-### Task 2: 同步文档与消融脚本默认
+### Task 2: 同步文档默认
 
 **Files:**
 - Modify: `README.md`
 - Modify: `docs/architecture.md`
-- Modify: `docs/reward_presets.md`
-- Modify: `scripts/run_reward_preset_ablation.py`
 - Modify: `scripts/train.py`（仅模块顶部用法示例行，若仍含 `--num-envs 16`）
 
 **Interfaces:**
 - Consumes: Task 1 落地后的 `PPOConfig.num_envs == 32` 等
-- Produces: 文档/脚本文案与 argparse 默认与 `PPOConfig` 一致
+- Produces: 文档文案与 `PPOConfig` 一致
 
 - [ ] **Step 1: Update README quick start comment**
 
@@ -150,45 +148,26 @@ python scripts/train.py --arch transformer --run-name tf_r100
 - 设备：默认 `cuda`；评估默认 `eval_workers=8`、`eval_episodes=32`、`eval_interval=5`（CUDA 下并行 eval 用 spawn+CPU）
 ```
 
-- [ ] **Step 3: Update reward preset docs + runner defaults**
-
-In `docs/reward_presets.md`, change `num-envs=16` → `num-envs=32` in the recommended script sentence.
-
-In `scripts/run_reward_preset_ablation.py`:
-- docstring: `num_envs=16` → `num_envs=32`
-- argparse: `parser.add_argument("--num-envs", type=int, default=32)`  
-  （或 `default=PPOConfig.num_envs`，需 `from config import PPOConfig`；二选一，优先直接 `32` 与设计字面一致亦可，但更稳妥是 `PPOConfig.num_envs` 避免再漂移）
-
-Preferred:
-
-```python
-from config import PPOConfig, REWARD_PRESETS, list_reward_presets
-# ...
-parser.add_argument("--num-envs", type=int, default=PPOConfig.num_envs)
-```
-
-- [ ] **Step 4: Update `scripts/train.py` docstring example**
+- [ ] **Step 3: Update `scripts/train.py` docstring example**
 
 ```text
     python scripts/train.py --total-steps 5000000 --num-envs 32 --device cuda
 ```
 
-- [ ] **Step 5: Grep for stale defaults**
+- [ ] **Step 4: Grep for stale defaults**
 
-Run: `rg -n 'num_envs=16|num-envs 16|16 envs|eval_workers=1' README.md docs/architecture.md docs/reward_presets.md scripts/run_reward_preset_ablation.py scripts/train.py config.py`
+Run: `rg -n 'num_envs=16|num-envs 16|16 envs|eval_workers=1' README.md docs/architecture.md scripts/train.py config.py`
 
 Expected: 无残留「默认 16」表述（设计文档/plans 里的基线叙述可保留）。`evaluate_policy` 形参默认 `eval_workers: int = 1` 是函数签名 fallback，可保留；真正训练路径必须走 `PPOConfig.eval_workers`。
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add README.md docs/architecture.md docs/reward_presets.md \
-  scripts/run_reward_preset_ablation.py scripts/train.py
+git add README.md docs/architecture.md scripts/train.py
 git commit -m "$(cat <<'EOF'
 docs: sync training default env/eval counts with PPOConfig
 
-Keep README, architecture, and reward-preset runner text aligned
-with the higher-throughput CUDA defaults.
+Keep README and architecture text aligned with the higher-throughput CUDA defaults.
 EOF
 )"
 ```

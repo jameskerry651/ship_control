@@ -38,7 +38,10 @@ Track 期间若有艇离开 in-zone，`track_streak` 清零，但 `capture` 状�
 
 ## 初始化
 
-拖轮默认放在大船周围圆环上：`tug_init_mode=circle`，`tug_init_radius_m=100`。
+拖轮默认通过安全拒绝采样放在大船周围 120 m 圆环上：
+`tug_init_mode=circle`，`tug_init_schema=safe_circle_v2`。初始化保证船体间隙和艇间距均超过硬碰撞阈值 5 m；显式使用较小半径时会对不可行方向做条件采样并发出警告。
+
+位置生成后，默认以 `tug_slot_assignment_mode=minimax` 将匿名采样位置匹配到唯一 slot：先最小化最远单艇的初始直线距离，再以团队总距离和 slot 字典序消除平局。匹配后按 slot 顺序规范化为 canonical agent 角色，单个 episode 内保持不变；历史复现可使用 `--slot-assignment fixed`。
 
 远距复现：
 
@@ -48,4 +51,4 @@ python scripts/train.py --arch transformer --run-name tf_r200 --init-radius 200
 
 ## 默认超参
 
-见 `config.py`：`hold_time_s=2.0`，`track_horizon_s=30.0`，`tug_init_radius_m=100.0`。
+见 `config.py`：`hold_time_s=2.0`，`track_horizon_s=30.0`，`tug_init_radius_m=120.0`。

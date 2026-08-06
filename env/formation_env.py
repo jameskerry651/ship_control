@@ -1,7 +1,7 @@
 """多智能体拖轮编队环境。
 
-任务：4 艘拖轮 + 1 艘移动的大船。每艘拖轮被分配到大船周围一个固定的 slot
-（船首左/右、船尾左/右），需自行接近 slot、避碰入位，并在入位后持续跟随。
+任务：4 艘拖轮 + 1 艘移动的大船。reset 时按初始位置为每艘拖轮分配一个唯一 slot
+（船首左/右、船尾左/右），episode 内保持该分配，需自行接近、避碰入位并持续跟随。
 
 阶段：
 - Approach：远距接近 slot，避碰；
@@ -12,7 +12,7 @@
 - 单环境一次接受 (n_tugs, action_dim) 的动作，返回 (n_tugs, obs_dim) 的观察。
 - 4 个智能体共享同一份策略网络（参数共享），观察都用"以自身为参考系"的相对量。
 - 奖励是逐 agent 计算，但碰撞/成功这种全局事件所有 agent 同步收到。
-- 初始化时 slot 角色固定为 tug i → slot i。
+- 默认用 minimax 匹配降低最难单艇航程；可切换 fixed 复现旧的 tug i → slot i。
 
  模块拆分：
 - init.py       初始位置/状态采样
@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 
 from config import EnvConfig
-from env.init import sample_tug_init_states
+from env.init import assign_tugs_to_slots, sample_tug_init_states
 from env.obs_spec import (
     ACTION_DIM,
     ObservationSpec,
@@ -49,7 +49,7 @@ from env.state import (
     local_to_world,
     world_to_local,
 )
-from physics.large_ship_model import LargeShipModel
+from physics.large_ship_model import LargeShipModel, distance_from_rectangular_hull_pose
 from physics.tugboat_dynamics_model import TugboatDynamicsModel, Vec3
 
 def _world_to_local(dx: float, dy: float, psi_local: float) -> tuple[float, float]:
@@ -77,6 +77,7 @@ class FormationEnv:
     motion_history: np.ndarray = field(init=False)
     action_history: np.ndarray = field(init=False)
     last_reward_components: dict = field(init=False)
+    last_init_diagnostics: dict[str, object] = field(init=False)
     tug_to_slot: np.ndarray = field(init=False)
     observation_spec: ObservationSpec = field(init=False)
 
@@ -116,6 +117,7 @@ class FormationEnv:
             (self.n_tugs, hist_len, ACTION_DIM), dtype=np.float32
         )
         self.last_reward_components = {}
+        self.last_init_diagnostics = {}
 
         # MutableEpisodeState 替代原来的散落字段
         dist_hist_cap = self._dist_hist_cap()
@@ -212,17 +214,15 @@ class FormationEnv:
     def _distance_from_ship_hull_pose(
         self, x_world: float, y_world: float, ship_x: float, ship_y: float, ship_psi: float,
     ) -> float:
-        dx = x_world - ship_x
-        dy = y_world - ship_y
-        cos_p = math.cos(ship_psi)
-        sin_p = math.sin(ship_psi)
-        x_b = cos_p * dx + sin_p * dy
-        y_b = -sin_p * dx + cos_p * dy
-        l_half = self.ship.length_m / 2.0
-        b_half = self.ship.beam_m / 2.0
-        ex = max(abs(x_b) - l_half, 0.0)
-        ey = max(abs(y_b) - b_half, 0.0)
-        return math.hypot(ex, ey)
+        return distance_from_rectangular_hull_pose(
+            x_world,
+            y_world,
+            ship_x,
+            ship_y,
+            ship_psi,
+            self.ship.length_m,
+            self.ship.beam_m,
+        )
 
     # ------------------------------------------------------------- reset
 
@@ -247,9 +247,34 @@ class FormationEnv:
         self._episode.track_steps_all_in_zone = 0
         self.ship.reset(self.rng)
 
-        self.tug_to_slot = np.arange(self.n_tugs, dtype=np.int32)
-        tug_xy, tug_psi, tug_nu, init_actions = sample_tug_init_states(
-            self.rng, self.n_tugs, self.ship.x, self.ship.y, self.cfg)
+        tug_xy, tug_psi, tug_nu, init_actions, init_diagnostics = sample_tug_init_states(
+            self.rng,
+            self.n_tugs,
+            self.ship.x,
+            self.ship.y,
+            self.ship.psi,
+            self.cfg,
+        )
+        slot_world = self.ship.slot_positions_world()
+        sample_to_slot, assignment_diagnostics = assign_tugs_to_slots(
+            tug_xy,
+            slot_world,
+            self.cfg.tug_slot_assignment_mode,
+        )
+        # 拖轮动力学与策略参数同构：把匿名采样状态按获配 slot 排序到 canonical
+        # agent index，保持 critic 中 agent one-hot 隐含的固定角色语义。
+        canonical_order = np.argsort(sample_to_slot, kind="stable")
+        tug_xy = tug_xy[canonical_order]
+        tug_psi = tug_psi[canonical_order]
+        tug_nu = tug_nu[canonical_order]
+        init_actions = init_actions[canonical_order]
+        self.tug_to_slot = sample_to_slot[canonical_order].astype(np.int32, copy=True)
+        self.last_init_diagnostics = {
+            **init_diagnostics,
+            **assignment_diagnostics,
+            "canonical_sample_order": tuple(int(v) for v in canonical_order),
+            "tug_to_slot": tuple(int(v) for v in self.tug_to_slot),
+        }
 
         for i, tug in enumerate(self.tugs):
             tug.reset()
@@ -260,7 +285,6 @@ class FormationEnv:
         self.last_actions = init_actions.copy()
         Observer.fill_obs_history(self.motion_history, self.action_history, self.tugs, init_actions)
 
-        slot_world = self.ship.slot_positions_world()
         for i, tug in enumerate(self.tugs):
             slot = slot_world[self.tug_to_slot[i]]
             self._episode.prev_dist[i] = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
@@ -618,6 +642,7 @@ class FormationEnv:
 
         return {
             "step": self.step_count,
+            "init": dict(self.last_init_diagnostics),
             "ship": {
                 "x": self.ship.x,
                 "y": self.ship.y,

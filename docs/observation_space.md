@@ -251,7 +251,7 @@ $$
 
 ## 7. 本 agent 目标 slot，5 维
 
-每个拖轮 `i` 被分配到一个固定目标 slot。目标 slot 的世界系位置与期望航向记为：
+每个拖轮 `i` 在 reset 时被分配到一个唯一目标 slot，该映射在当前 episode 内固定。目标 slot 的世界系位置与期望航向记为：
 
 $$
 s_i = (x_{\mathrm{slot},i}, y_{\mathrm{slot},i}, \psi_{\mathrm{slot},i}).
