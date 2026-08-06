@@ -4,9 +4,10 @@
     R = w_dist * R_dist       (距离进度)
       + w_hold * R_hold       (近场保持)
       + w_vel  * R_vel        (速度匹配)
-      - w_coll * P_collision  (碰撞规避)
-      + R_shape               (势函数 shaping，默认关闭)
-      + R_team                (团队同步 softmin，默认关闭)
+      - w_coll * P_collision  (碰撞规避；船软碰可走廊软化)
+      - w_stall * P_stall     (停滞惩罚)
+      + R_shape               (势函数 shaping)
+      + R_team                (团队同步 softmin)
 
 终端奖励由 FormationEnv.step 处理，不参与稠密归一化。
 """
@@ -55,6 +56,58 @@ class FormationRewardComputer:
         time_weight = float(np.clip(1.0 - tcpa / max(horizon_s, 1e-6), 0.0, 1.0))
         return cls._barrier(dcpa, collision_distance, safe_distance) * time_weight
 
+    @staticmethod
+    def _corridor_gate(
+        tx: float,
+        ty: float,
+        slot_x: float,
+        slot_y: float,
+        ship_x: float,
+        ship_y: float,
+        d: float,
+        hold_start_m: float,
+        half_width_m: float,
+        axial_slack_m: float,
+    ) -> float:
+        """Approach corridor gate in [0, 1] along the ship→slot axis.
+
+        Axis ``e`` is the fixed unit vector from ship through slot. ``r`` is
+        slot→tug; ``a = r·e`` is outboard when positive. Overshoot past the slot
+        toward the hull is allowed up to ``axial_slack_m`` (``a >= -slack``).
+        """
+        if d >= hold_start_m:
+            return 0.0
+        if d <= 1e-6:
+            return 1.0
+        ax = slot_x - ship_x
+        ay = slot_y - ship_y
+        axis_norm = math.hypot(ax, ay)
+        if axis_norm <= 1e-6:
+            return 0.0
+        e_x = ax / axis_norm
+        e_y = ay / axis_norm
+        r_x = tx - slot_x
+        r_y = ty - slot_y
+        a = r_x * e_x + r_y * e_y
+        if a < -axial_slack_m:
+            return 0.0
+        lat = math.hypot(r_x - a * e_x, r_y - a * e_y)
+        lat_n = lat / max(half_width_m, 1e-6)
+        if lat_n >= 1.0:
+            lat_gate = 0.0
+        elif lat_n <= 0.0:
+            lat_gate = 1.0
+        else:
+            u = 1.0 - lat_n
+            lat_gate = u * u * (3.0 - 2.0 * u)
+        return float(lat_gate)
+
+    @staticmethod
+    def _ship_soft_scale(corridor_gate: float, s_min: float) -> float:
+        s_min = float(np.clip(s_min, 0.0, 1.0))
+        g = float(np.clip(corridor_gate, 0.0, 1.0))
+        return 1.0 - (1.0 - s_min) * g
+
     def compute_rewards(
         self, state: SimState, episode: MutableEpisodeState, actions: np.ndarray, slot_world: np.ndarray,
     ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -78,6 +131,10 @@ class FormationRewardComputer:
             "hull_dist": np.zeros(n, dtype=np.float32),
             "in_zone": np.zeros(n, dtype=np.bool_),
             "hold_gate": np.zeros(n, dtype=np.float32),
+            "corridor_gate": np.zeros(n, dtype=np.float32),
+            "ship_soft_scale": np.ones(n, dtype=np.float32),
+            "p_stall": np.zeros(n, dtype=np.float32),
+            "stall_scale": np.ones(n, dtype=np.float32),
         }
 
         ship_vx_w, ship_vy_w = state.ship.world_velocity()
@@ -103,6 +160,9 @@ class FormationRewardComputer:
         tug_safe_dist = max(float(getattr(cfg, "reward_collision_tug_safe_m", 80.0)), float(cfg.tug_collision_dist_m) + 1e-6)
         cpa_horizon_s = max(float(getattr(cfg, "reward_cpa_horizon_s", 60.0)), 1e-6)
         cpa_w = max(float(getattr(cfg, "reward_collision_cpa_w", 2.0)), 0.0)
+        corridor_half_w = max(float(getattr(cfg, "reward_corridor_half_width_m", 40.0)), 1e-6)
+        corridor_axial_slack = max(float(getattr(cfg, "reward_corridor_axial_slack_m", 30.0)), 0.0)
+        ship_soft_min = float(getattr(cfg, "reward_ship_soft_min_scale", 0.15))
 
         # --- potential shaping ---
         w_shape = float(getattr(cfg, "reward_shape_w", 0.0))
@@ -180,6 +240,20 @@ class FormationRewardComputer:
                 )
                 p_ship_cpa = self._cpa_risk(ship_dcpa_hull, ship_tcpa, cfg.ship_collision_dist_m, ship_safe_dist, cpa_horizon_s)
             p_ship = p_ship_prox + cpa_w * p_ship_cpa
+            c_gate = self._corridor_gate(
+                tug.x,
+                tug.y,
+                float(slot[0]),
+                float(slot[1]),
+                float(state.ship.x),
+                float(state.ship.y),
+                d,
+                hold_start_m,
+                corridor_half_w,
+                corridor_axial_slack,
+            )
+            soft = self._ship_soft_scale(c_gate, ship_soft_min)
+            p_ship *= soft
 
             p_tug_prox = 0.0
             p_tug_cpa = 0.0
@@ -229,6 +303,8 @@ class FormationRewardComputer:
             comp["hull_dist"][i] = d_hull
             comp["in_zone"][i] = in_zone_now
             comp["hold_gate"][i] = gate
+            comp["corridor_gate"][i] = c_gate
+            comp["ship_soft_scale"][i] = soft
 
         # -- team sync bonus --
         if w_team > 0.0:
