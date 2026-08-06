@@ -72,9 +72,10 @@ R_{\mathrm{team}}.
 - 以当前位置到 slot 的连线为轴向；
 - 横向半宽 `reward_corridor_half_width_m`（默认 40 m）；
 - 轴向允许越过 slot 的余量 `reward_corridor_axial_slack_m`（默认 30 m），避免到位瞬间掉出走廊；
-- 设 \(\mathbf{e}\) 为指向 slot 的单位向量，相对位移 \(\mathbf{r}\)，则轴向 \(a=\mathbf{r}\cdot\mathbf{e}\)、横向 \(\ell=\|\mathbf{r}-a\mathbf{e}\|\)。
-- 走廊内条件：\(-\texttt{axial\_slack} \le a \le d+\varepsilon\) 且 \(\ell \le\) half_width（实现可用对 \(\ell/\texttt{half\_width}\) 的 smoothstep，使 `corridor_gate` 连续）。
-- `corridor_gate`：在走廊内且 \(d < d_{\mathrm{near}}\)（默认 150 m，与 `reward_hold_start_m` 一致）时升高；走廊外为 0。
+- 轴 \(\mathbf{e}\) 为**船心→己方 slot** 的固定单位向量（不可用瞬时 tug→slot，否则横向恒为 0）。
+- \(\mathbf{r}\) 为 slot→拖轮；轴向 \(a=\mathbf{r}\cdot\mathbf{e}\)（slot 外侧为正）、横向 \(\ell=\|\mathbf{r}-a\mathbf{e}\|\)。
+- 走廊内条件：\(a \ge -\texttt{axial\_slack}\) 且 \(\ell\) 经 half_width 归一化后的 smoothstep > 0，且 \(d < d_{\mathrm{near}}\)（默认 150 m，与 `reward_hold_start_m` 一致）。
+- `corridor_gate`：满足上式时升高；否则为 0。
 
 **软化：**
 

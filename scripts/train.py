@@ -89,7 +89,7 @@ class RewardNormalizer:
 
 
 # TensorBoard 只记核心曲线：任务进度 + PPO 健康度 + 少量奖励分解
-_TB_REWARD_KEYS = ("r_dist", "r_hold", "p_collision")
+_TB_REWARD_KEYS = ("r_dist", "r_hold", "p_collision", "p_stall")
 _TB_EVAL_KEYS = (
     "eval/return_mean",
     "eval/success_rate",

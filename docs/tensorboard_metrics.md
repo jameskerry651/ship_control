@@ -73,11 +73,12 @@ tensorboard --logdir runs
 
 | 指标 | 含义 | 如何读 |
 |------|------|--------|
-| `r_dist` | 距离/接近相关奖励（远距进度 + 绝对靠近） | Approach 阶段应有贡献；入位后 gate 切向 hold，此项变弱属正常 |
+| `r_dist` | 距离/接近相关奖励（进度为主 + 弱绝对靠近，含 stall_scale） | Approach 阶段应有贡献；入位后 gate 切向 hold，此项变弱属正常 |
 | `r_hold` | 站位保持分（位置/航向/速度综合，近距开启） | Capture/Track 阶段应上升或维持 |
-| `p_collision` | 碰撞风险惩罚项（势垒 + CPA，非负） | 越小越好；升高常伴随 `collision_rate` 变差 |
+| `p_collision` | 碰撞风险惩罚项（势垒 + CPA，船项可走廊软化；非负） | 越小越好；升高常伴随 `collision_rate` 变差 |
+| `p_stall` | 停滞惩罚项（乘权重前；Hold 区为 0） | 长期打满却不靠近 → 假阳性/刷分；应随净接近下降 |
 
-总步奖励还含 shaping、team、终端奖罚等，**未全部写入 TensorBoard**；上表只保留读训练最有用的三项。
+总步奖励还含 shaping、team、终端奖罚等，**未全部写入 TensorBoard**；上表只保留读训练最有用的项。
 
 ---
 
