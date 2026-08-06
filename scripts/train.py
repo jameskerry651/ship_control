@@ -105,7 +105,7 @@ def _add_finite_scalar(writer: SummaryWriter, tag: str, value: float, step: int)
     if math.isfinite(float(value)):
         writer.add_scalar(tag, float(value), step)
 
-from config import EnvConfig, PPOConfig
+from config import EnvConfig, PPOConfig, REWARD_PRESETS, apply_reward_preset, list_reward_presets
 from env.formation_env import ACTION_DIM, FormationEnv
 from rl.ppo import MAPPOActorCritic, MAPPORolloutBuffer, mappo_update
 
@@ -697,6 +697,15 @@ def main() -> None:
                         help="覆盖 EnvConfig.heading_tol_rad（单位：度）")
     parser.add_argument("--speed-tol", type=float, default=None,
                         help="覆盖 EnvConfig.speed_tol_ms")
+    parser.add_argument(
+        "--reward-preset",
+        type=str,
+        default=None,
+        help=(
+            "应用奖励超参 preset（config.REWARD_PRESETS）；"
+            f"可选: {', '.join(list_reward_presets())}"
+        ),
+    )
     parser.add_argument("--reward-precision-w", type=float, default=None,
                         help="覆盖 EnvConfig.reward_precision_w，默认关闭")
     parser.add_argument("--reward-precision-scale", type=float, default=None,
@@ -756,6 +765,11 @@ def main() -> None:
         env_cfg.reward_near_hold_w = float(args.reward_near_hold_w)
     if args.reward_near_hold_scale is not None:
         env_cfg.reward_near_hold_scale_m = float(args.reward_near_hold_scale)
+    reward_preset_id: str | None = None
+    try:
+        reward_preset_id = apply_reward_preset(env_cfg, args.reward_preset)
+    except ValueError as exc:
+        raise SystemExit(f"[reward] {exc}") from exc
     if args.total_steps is not None:
         total_steps = int(args.total_steps)
     elif course_spec is not None and course_spec.total_steps is not None:
@@ -804,13 +818,26 @@ def main() -> None:
           f"obs_history_k={env_cfg.obs_history_k}, "
           f"ship_preview_times={env_cfg.obs_ship_preview_times_s}, "
           f"ship_size_randomize={env_cfg.ship_size_randomize}")
+    if reward_preset_id is not None:
+        overrides = dict(REWARD_PRESETS[reward_preset_id])
+        print(f"[reward] preset = {reward_preset_id}, overrides = {overrides}")
+        print(
+            f"[reward] dist_w={env_cfg.reward_dist_w}, "
+            f"ship_safe_m={env_cfg.reward_collision_ship_safe_m}, "
+            f"coll_w={env_cfg.reward_collision_w}, "
+            f"cpa_w={env_cfg.reward_collision_cpa_w}, "
+            f"shape_w={env_cfg.reward_shape_w}"
+        )
+    else:
+        print("[reward] preset = (none)")
     if int(args.critic_warmup_updates) > 0:
         print(f"[init] critic_warmup_updates = {args.critic_warmup_updates} "
               "(actor frozen, eval/best skipped during warmup)")
 
     # 把超参数 dump 到 tensorboard 与文本
     hparams_text = "\n".join([f"env.{k} = {v}" for k, v in asdict(env_cfg).items()] +
-                             [f"ppo.{k} = {v}" for k, v in asdict(ppo_cfg).items()])
+                             [f"ppo.{k} = {v}" for k, v in asdict(ppo_cfg).items()] +
+                             [f"reward_preset = {reward_preset_id or ''}"])
     writer.add_text("hparams", hparams_text.replace("\n", "  \n"), 0)
     if course_metadata is not None:
         course_text = "\n".join(f"{k} = {v}" for k, v in course_metadata.items())
