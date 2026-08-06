@@ -17,6 +17,7 @@ class EnvConfig:
     # 大船（固定）
     ship_length_m: float = 200.0
     ship_beam_m: float = 30.0
+    ship_size_randomize: bool = False  # kept for CLI compat with train.py until train WIP lands
     ship_speed_min: float = 1.0
     ship_speed_max: float = 1.0
     ship_yaw_rate_max: float = 0.0
