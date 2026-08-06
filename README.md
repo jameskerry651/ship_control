@@ -60,10 +60,10 @@ docs/                设计文档
 ```bash
 pip install torch numpy pygame tensorboard scipy
 
-# 训练（默认 cuda + subproc + 16 envs、安全 init 半径 120 m、5M env-steps）
+# 训练（默认：cuda 批环境 · num_envs=12288 · minibatch=65536 · 50M steps）
 python scripts/train.py --arch transformer --run-name tf_r120
 # 远距：python scripts/train.py --arch transformer --run-name tf_r200 --init-radius 200
-# 弱机器：加 --device cpu --env-backend sync --num-envs 2
+# 弱机器：加 --device cpu --env-backend sync --num-envs 2 --minibatch-size 256 --rollout-steps 128
 
 # TensorBoard（指标说明见 docs/tensorboard_metrics.md）
 tensorboard --logdir runs

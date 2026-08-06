@@ -138,16 +138,19 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     target_kl: float = 0.015
 
-    rollout_steps: int = 512
-    # 默认面向多核 CPU + CUDA GPU（如 RTX 3090）；弱机器可用 CLI 下调
-    num_envs: int = 16
-    minibatch_size: int = 2048
+    # 默认面向 RTX 3090 级 GPU 批仿真扫参峰值（弱机器请 CLI 下调）
+    rollout_steps: int = 128
+    num_envs: int = 12288
+    minibatch_size: int = 65536
     update_epochs: int = 4
+    # sync | subproc | cuda；默认 cuda 批动力学（需 --device cuda）
+    env_backend: str = "cuda"
 
     learning_rate: float = 1e-4
     lr_anneal: bool = True
     lr_min_factor: float = 0.05
-    total_steps: int = 5_000_000
+    # 与大 num_envs 配套：约 50M / (128×12288×4) ≈ 8 个 PPO update
+    total_steps: int = 50_000_000
 
     # Actor 时序架构：mlp | transformer（gru/lstm 预留）
     actor_arch: str = "mlp"
@@ -158,12 +161,12 @@ class PPOConfig:
     tf_dropout: float = 0.0
 
     log_interval: int = 1
-    # num_envs=16 后每 update 样本量更大；收紧间隔以保持与旧 8-env 相近的评估/存盘密度
-    save_interval: int = 5
+    # 大 batch 下 update 次数较少；每 2 个 update 评估一次以保留曲线密度。
+    save_interval: int = 2
     eval_interval: int = 2
-    eval_episodes: int = 64
-    # CUDA 训练后 fork 子进程易挂死；并行 eval 需 spawn+CPU（见 train.py）。默认 1 最稳。
-    eval_workers: int = 1
+    eval_episodes: int = 32
+    # 评估仍用 CPU FormationEnv；策略在主进程 device 上批量推理。
+    eval_workers: int = 32
     device: str = "cuda"
     seed: int = 42
 

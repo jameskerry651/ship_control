@@ -1,12 +1,13 @@
 """MAPPO 多智能体拖轮编队训练脚本。
 
 用法：
-    python scripts/train.py --total-steps 5000000 --num-envs 16 --device cuda
+    python scripts/train.py --arch transformer --run-name tf_r120
+    # 弱机器：--device cpu --env-backend sync --num-envs 2 --minibatch-size 256
 
 特性：
 - 去中心化 actor：每艘拖轮只看自己的局部观察
 - 集中式 critic：使用 canonical global state，输出每艘拖轮的 value
-- 向量化环境：SyncVecEnv（单进程）或 SubprocVecEnv（多进程 rollout）
+- 向量化环境：默认 CudaVecEnv（亦可 sync / subproc）
 - 控制台 + tensorboard 双日志
 - 自动按 success 优先保存 best.pt；0% success 阶段用 final_dist/collision 预成功指标避免早停在远距离模型
 - 周期性保存 last.pt（用于断点续训或观察当前训练状态）
@@ -23,7 +24,6 @@ import signal
 import sys
 import time
 from collections import deque
-from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from multiprocessing import Pipe, get_context
 from pathlib import Path
@@ -219,7 +219,7 @@ def _subproc_env_worker(conn: Any, env_cfg: EnvConfig, seed: int) -> None:
                 conn.send(("ok", None))
                 break
             if cmd == "reset":
-                conn.send(("ok", env.reset()))
+                conn.send(("ok", env.reset(seed=payload)))
             elif cmd == "step":
                 obs, rew, done, info = env.step(payload)
                 conn.send(("ok", (obs, rew, done, info, env.get_global_state())))
@@ -390,9 +390,10 @@ def make_vec_env(
     env_cfg: EnvConfig,
     n_envs: int,
     base_seed: int,
-    backend: Literal["sync", "subproc"],
+    backend: Literal["sync", "subproc", "cuda"],
     env_workers: int | None,
-) -> SyncVecEnv | SubprocVecEnv:
+    device: str | torch.device = "cuda",
+) -> SyncVecEnv | SubprocVecEnv | Any:
     if backend == "subproc":
         # fork context：worker 不需要 torch（只用纯物理仿真），用 spawn 会导致
         # 8 个进程同时 import torch 初始化 MPS 死锁（macOS + MPS 特定问题）。
@@ -403,17 +404,36 @@ def make_vec_env(
             n_workers=env_workers or n_envs,
             start_method="fork",
         )
+    if backend == "cuda":
+        from env.gpu import CudaVecEnv
+
+        if env_workers not in (None, 1):
+            print("[warn] --env-workers 仅在 --env-backend subproc 时生效，已忽略。")
+        dev = torch.device(device)
+        if dev.type != "cuda":
+            raise SystemExit(
+                "[env] --env-backend cuda 需要 --device cuda（策略与环境同卡）"
+            )
+        return CudaVecEnv(
+            env_cfg,
+            n_envs=n_envs,
+            base_seed=base_seed,
+            device=dev,
+            dtype=torch.float32,
+        )
     if env_workers not in (None, 1):
         print("[warn] --env-workers 仅在 --env-backend subproc 时生效，已忽略。")
     return SyncVecEnv(env_cfg, n_envs=n_envs, base_seed=base_seed)
 
 
 # ---------- 评估循环（确定性策略，跑若干 episode） ----------
-def _build_global_state(vec_env: SyncVecEnv | SubprocVecEnv) -> np.ndarray:
+def _build_global_state(vec_env: SyncVecEnv | SubprocVecEnv | Any) -> np.ndarray:
     """收集每个环境的 canonical global state，形状 (N, global_state_dim)。"""
     if isinstance(vec_env, SubprocVecEnv):
         states = vec_env._request_all("get_global_state")
         return np.stack(states, axis=0).astype(np.float32, copy=False)
+    if type(vec_env).__name__ == "CudaVecEnv":
+        return np.asarray(vec_env.get_global_state(), dtype=np.float32)
     return np.stack([e.get_global_state() for e in vec_env.envs], axis=0).astype(
         np.float32, copy=False
     )
@@ -573,22 +593,6 @@ def _load_checkpoint(
     return int(ckpt.get("update", 0)), int(ckpt.get("global_step", 0)), True
 
 
-def _run_eval_episode(
-    episode_seed: int,
-    env_cfg: EnvConfig,
-    state_dict: dict[str, torch.Tensor],
-    model_kwargs: dict[str, Any],
-    device_str: str,
-) -> tuple[float, int, bool, bool, float, bool, float]:
-    """单回合评估（供多进程 eval 调用，每次创建新模型）。"""
-    device = torch.device(device_str)
-    model = MAPPOActorCritic(**model_kwargs)
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-    return _run_eval_episode_with_model(episode_seed, env_cfg, model)
-
-
 def _run_eval_episode_with_model(
     episode_seed: int,
     env_cfg: EnvConfig,
@@ -636,11 +640,163 @@ def _run_eval_episode_with_model(
     )
 
 
-def _run_eval_episode_task(
-    task: tuple[int, EnvConfig, dict[str, torch.Tensor], dict[str, Any], str],
+class _BatchedEvalEnv:
+    """CPU 子进程只跑环境，策略在主进程按 batch 推理。
+
+    与 rollout 的 SubprocVecEnv 不同，这里不会自动 reset。评估调度器需要在一个
+    episode 结束后显式传入下一局 seed，保证并行评估与顺序评估使用相同的 seed 集。
+    """
+
+    def __init__(self, env_cfg: EnvConfig, n_envs: int, *, start_method: str = "spawn") -> None:
+        self.n_envs = int(n_envs)
+        ctx = get_context(start_method)
+        self._conns: list[Any] = []
+        self._processes: list[Any] = []
+        for i in range(self.n_envs):
+            parent_conn, child_conn = Pipe()
+            proc = ctx.Process(
+                target=_subproc_env_worker,
+                args=(child_conn, env_cfg, i),
+                daemon=True,
+            )
+            proc.start()
+            child_conn.close()
+            self._conns.append(parent_conn)
+            self._processes.append(proc)
+
+    def reset_at(self, indices: np.ndarray, seeds: list[int]) -> list[np.ndarray]:
+        if len(indices) != len(seeds):
+            raise ValueError("indices and seeds must have the same length")
+        for env_idx, episode_seed in zip(indices, seeds):
+            self._conns[int(env_idx)].send(("reset", int(episode_seed)))
+        return [_subproc_recv(self._conns[int(env_idx)]) for env_idx in indices]
+
+    def step_at(
+        self, indices: np.ndarray, actions: np.ndarray
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, dict, np.ndarray]]:
+        if len(indices) != len(actions):
+            raise ValueError("indices and actions must have the same length")
+        for env_idx, action in zip(indices, actions):
+            self._conns[int(env_idx)].send(("step", action))
+        return [_subproc_recv(self._conns[int(env_idx)]) for env_idx in indices]
+
+    def close(self) -> None:
+        for conn in self._conns:
+            try:
+                conn.send(("close", None))
+                _subproc_recv(conn)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            finally:
+                conn.close()
+        for proc in self._processes:
+            proc.join(timeout=1.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1.0)
+
+
+def _eval_result_from_info(
+    episode_return: float,
+    episode_length: int,
+    info: dict,
 ) -> tuple[float, int, bool, bool, float, bool, float]:
-    """ProcessPoolExecutor.map 的单参数包装。"""
-    return _run_eval_episode(*task)
+    comp = info.get("reward_components", {})
+    dist_arr = comp.get("dist_to_slot") if isinstance(comp, dict) else None
+    final_dist = float(np.nanmean(dist_arr)) if dist_arr is not None else float("nan")
+    return (
+        float(episode_return),
+        int(episode_length),
+        bool(info.get("success", False)),
+        bool(info.get("collision", False)),
+        final_dist,
+        bool(info.get("capture", False)),
+        float(info.get("track_in_zone_ratio", 0.0)),
+    )
+
+
+def _run_batched_eval(
+    model: MAPPOActorCritic,
+    env_cfg: EnvConfig,
+    n_episodes: int,
+    seed: int,
+    n_envs: int,
+    runner: _BatchedEvalEnv | None = None,
+) -> list[tuple[float, int, bool, bool, float, bool, float]]:
+    """并行环境 + 单 GPU/设备批量策略推理，返回按 episode seed 排序的结果。"""
+    owns_runner = runner is None
+    if runner is None:
+        runner = _BatchedEvalEnv(env_cfg, min(n_envs, n_episodes))
+    elif runner.n_envs > n_episodes:
+        raise ValueError("persistent eval runner cannot have more envs than episodes")
+    result_slots: list[tuple[float, int, bool, bool, float, bool, float] | None] = [
+        None
+    ] * n_episodes
+    worker_count = runner.n_envs
+    episode_ids = np.arange(worker_count, dtype=np.int64)
+    active = np.ones(worker_count, dtype=bool)
+    episode_returns = np.zeros(worker_count, dtype=np.float64)
+    episode_lengths = np.zeros(worker_count, dtype=np.int32)
+    obs: list[np.ndarray | None] = [None] * worker_count
+    next_episode_id = worker_count
+
+    try:
+        initial_indices = np.arange(worker_count, dtype=np.int64)
+        initial_obs = runner.reset_at(
+            initial_indices, [seed + i for i in range(worker_count)]
+        )
+        for env_idx, obs_i in enumerate(initial_obs):
+            obs[env_idx] = obs_i
+
+        while active.any():
+            active_indices = np.flatnonzero(active)
+            obs_batch = np.stack([obs[int(i)] for i in active_indices], axis=0)
+            with torch.no_grad():
+                obs_t = torch.as_tensor(
+                    obs_batch, dtype=torch.float32, device=next(model.parameters()).device
+                )
+                flat_obs = obs_t.reshape(-1, obs_t.shape[-1])
+                action, _, _ = model.act(flat_obs, deterministic=True)
+                action = action.reshape(len(active_indices), env_cfg.n_tugs, -1)
+            step_results = runner.step_at(active_indices, action.cpu().numpy())
+
+            resets: list[tuple[int, int]] = []
+            for env_idx_raw, (next_obs, rew, done, info, _global_state) in zip(
+                active_indices, step_results
+            ):
+                env_idx = int(env_idx_raw)
+                episode_returns[env_idx] += float(np.asarray(rew).mean())
+                episode_lengths[env_idx] += 1
+                if bool(np.asarray(done).any()):
+                    episode_id = int(episode_ids[env_idx])
+                    result_slots[episode_id] = _eval_result_from_info(
+                        episode_returns[env_idx], episode_lengths[env_idx], info
+                    )
+                    if next_episode_id < n_episodes:
+                        episode_ids[env_idx] = next_episode_id
+                        resets.append((env_idx, seed + next_episode_id))
+                        next_episode_id += 1
+                    else:
+                        active[env_idx] = False
+                        obs[env_idx] = None
+                else:
+                    obs[env_idx] = next_obs
+
+            if resets:
+                reset_indices = np.asarray([item[0] for item in resets], dtype=np.int64)
+                reset_obs = runner.reset_at(reset_indices, [item[1] for item in resets])
+                for env_idx_raw, obs_i in zip(reset_indices, reset_obs):
+                    env_idx = int(env_idx_raw)
+                    obs[env_idx] = obs_i
+                    episode_returns[env_idx] = 0.0
+                    episode_lengths[env_idx] = 0
+    finally:
+        if owns_runner:
+            runner.close()
+
+    if any(result is None for result in result_slots):
+        raise RuntimeError("batched evaluation ended before all episodes completed")
+    return [result for result in result_slots if result is not None]
 
 
 def evaluate_policy(
@@ -652,42 +808,33 @@ def evaluate_policy(
     *,
     eval_workers: int = 1,
     model_kwargs: dict[str, Any] | None = None,
+    eval_runner: _BatchedEvalEnv | None = None,
 ) -> dict[str, float]:
     if model_kwargs is None:
         raise ValueError("model_kwargs is required for evaluate_policy")
 
-    if eval_workers <= 1:
-        # 创建一次 eval 模型，重复使用，避免 MPS 反复分配模型（~6s/次）。
-        eval_model = MAPPOActorCritic(**model_kwargs)
-        eval_model.load_state_dict(model.state_dict())
-        eval_model.to(device)
-        eval_model.eval()
-        results = [
-            _run_eval_episode_with_model(seed + i, env_cfg, eval_model)
-            for i in range(n_episodes)
-        ]
-    else:
-        # 并行 eval 固定 CPU + spawn：父进程已 init CUDA 后再 fork，子进程即使用 CPU 也会挂死。
-        state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        tasks = [
-            (seed + i, env_cfg, state_cpu, model_kwargs, "cpu")
-            for i in range(n_episodes)
-        ]
-        ctx = get_context("spawn")
-        results = []
-        try:
-            with ProcessPoolExecutor(max_workers=eval_workers, mp_context=ctx) as pool:
-                results = list(pool.map(_run_eval_episode_task, tasks, chunksize=1))
-        except (BrokenExecutor, Exception) as exc:
-            print(f"[eval-warn] parallel eval failed ({exc}); retrying with 1 worker.")
-            eval_model = MAPPOActorCritic(**model_kwargs)
-            eval_model.load_state_dict(model.state_dict())
-            eval_model.to(device)
-            eval_model.eval()
+    if n_episodes <= 0:
+        raise ValueError("n_episodes must be positive")
+
+    was_training = model.training
+    model.eval()
+    try:
+        if eval_workers <= 1:
             results = [
-                _run_eval_episode_with_model(seed + i, env_cfg, eval_model)
+                _run_eval_episode_with_model(seed + i, env_cfg, model)
                 for i in range(n_episodes)
             ]
+        else:
+            results = _run_batched_eval(
+                model,
+                env_cfg,
+                n_episodes=n_episodes,
+                seed=seed,
+                n_envs=eval_workers,
+                runner=eval_runner,
+            )
+    finally:
+        model.train(was_training)
 
     returns = [r[0] for r in results]
     lengths = [r[1] for r in results]
@@ -787,18 +934,28 @@ def main() -> None:
         choices=["mlp", "transformer", "gru", "lstm"],
         help="Actor 时序架构（默认 PPOConfig.actor_arch；gru/lstm 预留未实现）",
     )
-    parser.add_argument("--env-backend", type=str, default="subproc",
-                        choices=["sync", "subproc"],
-                        help="rollout 环境后端：subproc 多进程并行 step，sync 单进程顺序")
+    parser.add_argument("--env-backend", type=str, default=PPOConfig.env_backend,
+                        choices=["sync", "subproc", "cuda"],
+                        help="rollout 环境后端：默认 cuda（GPU 批动力学）；弱机器用 sync/subproc")
     parser.add_argument("--env-workers", type=int, default=None,
                         help="subproc 环境进程数（默认等于 --num-envs）")
     parser.add_argument("--eval-workers", type=int, default=PPOConfig.eval_workers,
-                        help="评估并行进程数（默认 PPOConfig.eval_workers；1=顺序评估）")
+                        help="并行评估环境数；策略在主进程按 batch 推理")
+    parser.add_argument("--eval-interval", type=int, default=PPOConfig.eval_interval,
+                        help="每多少个 PPO update 执行一次评估")
+    parser.add_argument("--eval-episodes", type=int, default=PPOConfig.eval_episodes,
+                        help="每次评估的 episode 数")
     parser.add_argument("--torch-threads", type=int, default=0,
                         help="PyTorch CPU 算子线程数，0 表示不修改默认")
     args = parser.parse_args()
 
     eval_workers = int(args.eval_workers)
+    if eval_workers <= 0:
+        parser.error("--eval-workers must be positive")
+    if args.eval_interval <= 0:
+        parser.error("--eval-interval must be positive")
+    if args.eval_episodes <= 0:
+        parser.error("--eval-episodes must be positive")
     if args.torch_threads > 0:
         torch.set_num_threads(int(args.torch_threads))
 
@@ -834,12 +991,16 @@ def main() -> None:
         rollout_steps=args.rollout_steps,
         minibatch_size=args.minibatch_size,
         update_epochs=args.update_epochs,
+        env_backend=str(args.env_backend),
         learning_rate=args.learning_rate,
         entropy_coef=args.entropy_coef,
         target_kl=args.target_kl,
         seed=args.seed,
         device=args.device,
         actor_arch=actor_arch,
+        eval_interval=int(args.eval_interval),
+        eval_episodes=int(args.eval_episodes),
+        eval_workers=eval_workers,
     )
 
     # 随机种子
@@ -905,6 +1066,7 @@ def main() -> None:
         base_seed=ppo_cfg.seed,
         backend=args.env_backend,
         env_workers=args.env_workers,
+        device=ppo_cfg.device,
     )
     obs = vec_env.reset()
     global_state_dim = vec_env.envs[0].global_state_dim
@@ -1022,6 +1184,17 @@ def main() -> None:
         print("\n[interrupt] caught SIGINT, will save and exit after current update.")
         interrupt_flag["stop"] = True
     signal.signal(signal.SIGINT, _on_sigint)
+
+    eval_runner = (
+        _BatchedEvalEnv(env_cfg, min(eval_workers, ppo_cfg.eval_episodes))
+        if eval_workers > 1
+        else None
+    )
+    if eval_runner is not None:
+        print(
+            f"[init] persistent batched eval: {eval_runner.n_envs} CPU envs + "
+            f"{device.type.upper()} policy inference"
+        )
 
     t_start = time.time()
     last_completed_update = start_update
@@ -1182,6 +1355,19 @@ def main() -> None:
 
         # ---------- 4. 日志 ----------
         sps = samples_per_update / max(1e-6, rollout_dt + update_dt)
+        train_dt = max(1e-6, rollout_dt + update_dt)
+        rollout_frac = rollout_dt / train_dt
+        update_frac = update_dt / train_dt
+        peak_mem_mb = float("nan")
+        if device.type == "cuda" and torch.cuda.is_available():
+            peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024.0 ** 2)
+        writer.add_scalar("perf/rollout_seconds", rollout_dt, global_step)
+        writer.add_scalar("perf/update_seconds", update_dt, global_step)
+        writer.add_scalar("perf/rollout_fraction", rollout_frac, global_step)
+        writer.add_scalar("perf/update_fraction", update_frac, global_step)
+        writer.add_scalar("perf/train_samples_per_second", sps, global_step)
+        if peak_mem_mb == peak_mem_mb:  # not NaN
+            writer.add_scalar("perf/cuda_peak_mem_mb", peak_mem_mb, global_step)
         recent_ret = float(np.mean(ep_return_window)) if ep_return_window else float("nan")
         recent_len = float(np.mean(ep_length_window)) if ep_length_window else float("nan")
         succ_rate = float(np.mean(success_window)) if success_window else 0.0
@@ -1227,17 +1413,29 @@ def main() -> None:
                 f"ent={stats.entropy:+.3f} kl={stats.approx_kl:.4f} "
                 f"clip={stats.clip_frac:.2f} ev={stats.explained_variance:+.2f} "
                 f"lr={stats.learning_rate:.2e} | "
-                f"sps={sps:.0f} elapsed={elapsed/60:.1f}min"
+                f"sps={sps:.0f} "
+                f"roll={rollout_dt:.2f}s({rollout_frac*100:.0f}%) "
+                f"upd={update_dt:.2f}s({update_frac*100:.0f}%)"
+                + (
+                    f" mem={peak_mem_mb:.0f}MB/{torch.cuda.get_device_properties(device).total_memory / (1024**2):.0f}MB"
+                    if peak_mem_mb == peak_mem_mb
+                    else ""
+                )
+                + f" elapsed={elapsed/60:.1f}min"
             )
 
         # ---------- 5. 评估 + 保存 best ----------
         if (update + 1) % ppo_cfg.eval_interval == 0 and not in_warmup:
+            eval_t0 = time.time()
             eval_stats = evaluate_policy(
                 model, env_cfg, n_episodes=ppo_cfg.eval_episodes,
                 device=device, seed=ppo_cfg.seed + 9999 + update,
                 eval_workers=eval_workers,
                 model_kwargs=model_kwargs,
+                eval_runner=eval_runner,
             )
+            eval_dt = time.time() - eval_t0
+            writer.add_scalar("perf/eval_seconds", eval_dt, global_step)
             for k in _TB_EVAL_KEYS:
                 if k in eval_stats:
                     writer.add_scalar(k, eval_stats[k], global_step)
@@ -1249,7 +1447,8 @@ def main() -> None:
                 f"cap={eval_stats['eval/capture_rate']*100:.1f}%, "
                 f"trk={eval_stats['eval/track_in_zone_ratio']*100:.1f}%, "
                 f"coll={eval_stats['eval/collision_rate']*100:.1f}%, "
-                f"d={eval_stats['eval/final_dist_mean']:.1f}m"
+                f"d={eval_stats['eval/final_dist_mean']:.1f}m, "
+                f"time={eval_dt:.1f}s"
             )
            
             cur_succ = eval_stats["eval/success_rate"]
@@ -1359,6 +1558,8 @@ def main() -> None:
         metric=float(np.mean(ep_return_window)) if ep_return_window else 0.0,
         lr_scheduler=lr_scheduler,
     )
+    if eval_runner is not None:
+        eval_runner.close()
     vec_env.close()
     writer.close()
     if best_update >= 0:

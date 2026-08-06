@@ -77,17 +77,19 @@ simulator → physics only
 
 ## 5. 训练入口 `scripts/train.py`
 
-- 向量化：默认 `subproc` + `num_envs=16`（可用 `--env-backend sync` 覆盖）
-- 设备：默认 `cuda`；评估默认 `eval_workers=1`（CUDA 下并行 eval 用 spawn+CPU，显式加大时可用）
+- 向量化：默认 `cuda` + `num_envs=12288` + `minibatch_size=65536`（RTX 3090 扫参峰值；可用 `--env-backend sync|subproc` 覆盖）
+- `cuda`：[`env/gpu/CudaVecEnv`](../env/gpu/vec_env.py) + [`batched_step`](../env/gpu/batched_step.py)。设计见 [gpu-parallel-env-design](superpowers/specs/2026-08-07-gpu-parallel-env-design.md)
+- 设备：默认 `cuda`；评估默认 `eval_workers=32`（CPU env + 主进程策略推理）
 - 奖励 RunningMeanStd 归一化（稠密）+ 终端奖罚原尺度叠加
 - TensorBoard 核心曲线（见 [tensorboard_metrics.md](tensorboard_metrics.md)）
 - 按 eval `success_rate` 优先存 `best.pt`；定期 `last.pt`
-- CLI：`--arch`、`--init-radius`、`--reward-preset`（见 [arch_ablation.md](arch_ablation.md)；preset 映射见 `config.REWARD_PRESETS`）
+- CLI：`--arch`、`--init-radius`、`--reward-preset`、`--env-backend`（见 [arch_ablation.md](arch_ablation.md)；preset 映射见 `config.REWARD_PRESETS`）
 
 ## 6. 测试（与文档相关）
 
 | 测试 | 覆盖 |
 |------|------|
+| `tests/parity/` | CPU vs batched/CudaVecEnv 数值与事件对照（L0–L2） |
 | `tests/test_actor_arch.py` | mlp / transformer 工厂与形状 |
 | `tests/test_track_phase.py` | Capture / Track 终止 |
 | `tests/test_observation_spec.py` | ObservationSpec 契约 |
