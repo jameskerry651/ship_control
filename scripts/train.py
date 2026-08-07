@@ -1040,16 +1040,16 @@ def main() -> None:
     if reward_preset_id is not None:
         overrides = dict(REWARD_PRESETS[reward_preset_id])
         print(f"[reward] preset = {reward_preset_id}, overrides = {overrides}")
-        print(
-            f"[reward] dist_w={env_cfg.reward_dist_w}, "
-            f"distance_cost_w={env_cfg.reward_distance_cost_w}, "
-            f"dist_scale_m={env_cfg.reward_dist_scale_m}, "
-            f"ship_safe_m={env_cfg.reward_collision_ship_safe_m}, "
-            f"coll_w={env_cfg.reward_collision_w}, "
-            f"cpa_w={env_cfg.reward_collision_cpa_w}"
-        )
     else:
         print("[reward] preset = (none)")
+    print(
+        f"[reward] dist_w={env_cfg.reward_dist_w}, "
+        f"distance_cost_w={env_cfg.reward_distance_cost_w}, "
+        f"dist_scale_m={env_cfg.reward_dist_scale_m}, "
+        f"ship_safe_m={env_cfg.reward_collision_ship_safe_m}, "
+        f"coll_w={env_cfg.reward_collision_w}, "
+        f"cpa_w={env_cfg.reward_collision_cpa_w}"
+    )
     if int(args.critic_warmup_updates) > 0:
         print(f"[init] critic_warmup_updates = {args.critic_warmup_updates} "
               "(actor frozen, eval/best skipped during warmup)")

@@ -3,7 +3,7 @@
 > 实现：`env/reward.py` → `FormationRewardComputer.compute_rewards()`  
 > 配置：`config.py` → `EnvConfig`  
 > 终端奖罚：`env/formation_env.py` → `step()`（不参与稠密奖励归一化）  
-> 结构设计：`docs/superpowers/specs/2026-08-07-reward-redesign-design.md`
+> 结构设计：`docs/superpowers/specs/2026-08-07-reward-no-orbit-farming-design.md`
 
 ## 1. 稠密奖励
 

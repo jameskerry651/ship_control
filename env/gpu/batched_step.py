@@ -317,13 +317,22 @@ class FastBatchedStep:
 
         ep.in_zone_steps = torch.where(in_zone, ep.in_zone_steps + 1, (ep.in_zone_steps - 2).clamp_min(0))
         components = {
-            "r_total": rewards, "r_dist": r_dist, "p_distance": p_distance,
-            "r_hold": r_hold, "r_velocity": r_vel, "r_team": r_team.expand(-1, self.n_tugs),
-            "p_collision": p_coll, "p_ship_collision": p_ship, "p_tug_collision": p_tug,
-            "dist_to_slot": dist,
-            "heading_err_deg": dpsi.abs() * (180.0 / math.pi), "speed_err": speed_err,
-            "hull_dist": d["hull_dist"], "in_zone": in_zone,
-            "corridor_gate": corridor, "ship_soft_scale": soft,
+            "r_total": rewards.to(self.dtype),
+            "r_dist": r_dist.to(self.dtype),
+            "p_distance": p_distance.to(self.dtype),
+            "r_hold": r_hold.to(self.dtype),
+            "r_velocity": r_vel.to(self.dtype),
+            "r_team": r_team.expand(-1, self.n_tugs).to(self.dtype),
+            "p_collision": p_coll.to(self.dtype),
+            "p_ship_collision": p_ship.to(self.dtype),
+            "p_tug_collision": p_tug.to(self.dtype),
+            "dist_to_slot": dist.to(self.dtype),
+            "heading_err_deg": (dpsi.abs() * (180.0 / math.pi)).to(self.dtype),
+            "speed_err": speed_err.to(self.dtype),
+            "hull_dist": d["hull_dist"].to(self.dtype),
+            "in_zone": in_zone,
+            "corridor_gate": corridor.to(self.dtype),
+            "ship_soft_scale": soft.to(self.dtype),
         }
         return rewards, components, d
 

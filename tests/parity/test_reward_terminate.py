@@ -121,6 +121,25 @@ def test_fast_batched_tug_cpa_matches_cpu():
         _, reward_cpu, _, info_cpu = cpu.step(actions)
         _, reward_fast, _, info_fast, *_ = fast.step(actions[None])
 
+        for key in (
+            "r_total",
+            "r_dist",
+            "p_distance",
+            "r_hold",
+            "r_velocity",
+            "r_team",
+            "p_collision",
+            "p_ship_collision",
+            "p_tug_collision",
+            "dist_to_slot",
+            "heading_err_deg",
+            "speed_err",
+            "hull_dist",
+            "corridor_gate",
+            "ship_soft_scale",
+        ):
+            assert info_fast[0]["reward_components"][key].dtype == np.float32, key
+
         np.testing.assert_allclose(
             info_fast[0]["reward_components"]["p_tug_collision"],
             info_cpu["reward_components"]["p_tug_collision"],
