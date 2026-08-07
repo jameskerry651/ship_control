@@ -78,7 +78,16 @@ def test_reward_and_phase_match_after_gpu_dynamics():
 
     np.testing.assert_allclose(rew_g, info_c["reward_components"]["r_total"], rtol=1e-6, atol=1e-6)
     # Compare dense reward path via components
-    for key in ("r_dist", "r_hold", "p_collision", "p_stall"):
+    for key in (
+        "r_total",
+        "r_dist",
+        "p_distance",
+        "r_hold",
+        "r_team",
+        "p_collision",
+        "corridor_gate",
+        "ship_soft_scale",
+    ):
         np.testing.assert_allclose(
             info_g["reward_components"][key],
             info_c["reward_components"][key],
@@ -119,6 +128,14 @@ def test_fast_batched_tug_cpa_matches_cpu():
             atol=1e-4,
             err_msg=f"p_tug_collision@{step}",
         )
+        for key in ("r_dist", "p_distance", "r_hold", "r_team"):
+            np.testing.assert_allclose(
+                info_fast[0]["reward_components"][key],
+                info_cpu["reward_components"][key],
+                rtol=1e-4,
+                atol=1e-4,
+                err_msg=f"{key}@{step}",
+            )
         np.testing.assert_allclose(
             reward_fast[0],
             reward_cpu,

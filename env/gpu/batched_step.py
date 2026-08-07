@@ -241,42 +241,25 @@ class FastBatchedStep:
         cfg, ep, t, s = self.cfg, self.episode, self.batch.tugs, self.batch.ships
         dist, dpsi, speed_err = d["dist"], d["heading_err"], d["speed_err"]
         hold_start = max(float(cfg.reward_hold_start_m), 1e-6)
-        hold_full = max(float(cfg.reward_hold_full_m), 1e-6)
-        if hold_start < hold_full:
-            hold_start, hold_full = hold_full, hold_start
-        blend = ((hold_start - dist) / max(hold_start - hold_full, 1e-6)).clamp(0.0, 1.0)
-        gate = torch.where(dist <= hold_full, torch.ones_like(dist), torch.where(dist >= hold_start, torch.zeros_like(dist), blend.square() * (3.0 - 2.0 * blend)))
-        pos_score = (1.0 - dist / max(float(cfg.pos_tol_m), 1e-6)).clamp_min(0.0)
+        target_tol = max(float(cfg.pos_tol_m), 1e-6)
+        target_x = (1.0 - dist / target_tol).clamp(0.0, 1.0)
+        target_gate = target_x.square() * (3.0 - 2.0 * target_x)
         head_score = (1.0 - dpsi.abs() / max(float(cfg.heading_tol_rad), 1e-6)).clamp_min(0.0)
         speed_score = (1.0 - speed_err / max(float(cfg.speed_tol_ms), 1e-6)).clamp_min(0.0)
-        hold_score = pos_score * (0.5 + 0.25 * head_score + 0.25 * speed_score)
+        r_hold = target_gate * (0.5 + 0.25 * head_score + 0.25 * speed_score)
         in_zone = (dist < cfg.pos_tol_m) & (dpsi.abs() < cfg.heading_tol_rad) & (speed_err < cfg.speed_tol_ms)
 
         progress = ((ep.prev_dist - dist) / max(float(cfg.reward_dist_progress_clip_m), 1e-6)).clamp(-1.0, 1.0)
-        dist_bonus = (1.0 - dist / max(float(cfg.reward_dist_scale_m), 1e-6)).clamp(-0.5, 1.0)
-        frac = float(np.clip(cfg.reward_dist_progress_frac, 0.0, 1.0))
-        r_dist = (1.0 - gate) * (frac * progress + (1.0 - frac) * dist_bonus)
-        r_hold = gate * hold_score
-
-        stall_steps = max(1, int(math.ceil(max(float(cfg.reward_stall_window_s), 0.0) / max(float(cfg.dt_ctrl), 1e-6)))) if cfg.reward_stall_window_s > 0 else 0
-        p_stall = torch.zeros_like(dist)
-        if stall_steps:
-            old_idx = (ep.dist_hist_head - stall_steps) % ep.dist_hist.shape[-1]
-            old = ep.dist_hist.gather(2, old_idx[:, None, None].expand(-1, self.n_tugs, 1)).squeeze(-1)
-            delta = old - dist
-            min_progress = max(float(cfg.reward_stall_min_progress_m), 1e-6)
-            p_stall = ((min_progress - delta) / min_progress).clamp(0.0, 1.0)
-            p_stall = torch.where(
-                (gate < 0.99) & (ep.dist_hist_filled[:, None] >= stall_steps), p_stall, torch.zeros_like(p_stall)
-            )
-        stall_scale = 1.0 - (1.0 - float(np.clip(cfg.reward_stall_floor, 0.0, 1.0))) * p_stall
-        r_dist = r_dist * stall_scale
+        r_dist = (1.0 - target_gate) * progress
+        p_distance = (1.0 - target_gate) * (
+            dist / max(float(cfg.reward_dist_scale_m), 1e-6)
+        ).clamp(0.0, 1.0)
 
         speed_scale = max(float(getattr(cfg, "reward_velocity_speed_scale_ms", cfg.speed_tol_ms)), 1e-6)
         yaw_scale = max(float(getattr(cfg, "reward_velocity_yaw_scale_rads", 0.05)), 1e-6)
         speed_pen = 1.0 - torch.exp(-(speed_err / speed_scale).square())
         yaw_pen = 1.0 - torch.exp(-((t.nu[..., 2] - s.r[:, None]).abs() / yaw_scale).square())
-        r_vel = -gate * (0.8 * speed_pen + 0.2 * yaw_pen)
+        r_vel = -target_gate * (0.8 * speed_pen + 0.2 * yaw_pen)
 
         ship_safe = max(float(cfg.reward_collision_ship_safe_m), float(cfg.ship_collision_dist_m) + 1e-6)
         tug_safe = max(float(cfg.reward_collision_tug_safe_m), float(cfg.tug_collision_dist_m) + 1e-6)
@@ -331,16 +314,12 @@ class FastBatchedStep:
         p_tug = prox + cpa_w * pair_risk.masked_fill(eye, 0.0).sum(dim=-1)
         p_coll = (p_ship + p_tug).clamp_max(float(cfg.reward_collision_cap))
 
-        r_shape = torch.zeros_like(dist)
-        if cfg.reward_shape_w > 0.0:
-            cur_phi = -(0.6 * dist / max(float(cfg.reward_shape_d_ref_m), 1e-6) + 0.25 * speed_err / cfg.speed_tol_ms + 0.15 * dpsi.abs() / cfg.heading_tol_rad)
-            prev_phi = -(0.6 * ep.prev_dist / max(float(cfg.reward_shape_d_ref_m), 1e-6) + 0.25 * ep.prev_speed_err / cfg.speed_tol_ms + 0.15 * ep.prev_heading_err / cfg.heading_tol_rad)
-            r_shape = float(cfg.reward_shape_w) * (float(cfg.reward_shape_gamma) * cur_phi - prev_phi).clamp(-float(cfg.reward_shape_clip), float(cfg.reward_shape_clip))
-
         rewards = (
-            float(cfg.reward_dist_w) * r_dist + float(cfg.reward_hold_w) * r_hold
-            + float(cfg.reward_velocity_w) * r_vel - float(cfg.reward_collision_w) * p_coll
-            - float(cfg.reward_stall_w) * p_stall + r_shape
+            float(cfg.reward_dist_w) * r_dist
+            - max(float(cfg.reward_distance_cost_w), 0.0) * p_distance
+            + float(cfg.reward_hold_w) * r_hold
+            + float(cfg.reward_velocity_w) * r_vel
+            - float(cfg.reward_collision_w) * p_coll
         )
         # FormationRewardComputer writes each per-tug total into a float32
         # array before adding the team reward. Preserve that rounding in the
@@ -348,20 +327,21 @@ class FastBatchedStep:
         rewards = rewards.to(torch.float32).to(self.dtype)
         r_team = torch.zeros_like(rewards)
         if cfg.reward_team_w > 0.0:
-            z = pos_score * head_score * speed_score
             beta = max(float(cfg.reward_team_softmin_beta), 1e-6)
-            team = -torch.log(torch.exp(-beta * z).mean(dim=1)) / beta
-            r_team = (float(cfg.reward_team_w) * team[:, None]).to(torch.float32).to(self.dtype)
+            logits = beta * p_distance
+            weights = torch.softmax(logits, dim=1)
+            team_cost = (weights * p_distance).sum(dim=1, keepdim=True)
+            r_team = (-float(cfg.reward_team_w) * team_cost).to(torch.float32).to(self.dtype)
             rewards = rewards + r_team
 
         ep.in_zone_steps = torch.where(in_zone, ep.in_zone_steps + 1, (ep.in_zone_steps - 2).clamp_min(0))
         components = {
-            "r_total": rewards, "r_dist": r_dist, "r_hold": r_hold, "r_velocity": r_vel,
-            "r_shape": r_shape, "r_team": r_team, "p_collision": p_coll,
-            "p_ship_collision": p_ship, "p_tug_collision": p_tug, "p_stall": p_stall,
-            "stall_scale": stall_scale, "dist_to_slot": dist,
+            "r_total": rewards, "r_dist": r_dist, "p_distance": p_distance,
+            "r_hold": r_hold, "r_velocity": r_vel, "r_team": r_team.expand(-1, self.n_tugs),
+            "p_collision": p_coll, "p_ship_collision": p_ship, "p_tug_collision": p_tug,
+            "dist_to_slot": dist,
             "heading_err_deg": dpsi.abs() * (180.0 / math.pi), "speed_err": speed_err,
-            "hull_dist": d["hull_dist"], "in_zone": in_zone, "hold_gate": gate,
+            "hull_dist": d["hull_dist"], "in_zone": in_zone,
             "corridor_gate": corridor, "ship_soft_scale": soft,
         }
         return rewards, components, d
