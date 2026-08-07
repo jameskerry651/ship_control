@@ -30,8 +30,14 @@ class GpuEnvBatch:
         device: torch.device,
         dtype: torch.dtype = torch.float32,
     ) -> "GpuEnvBatch":
+        tugs = BatchedTugState.zeros(n_envs, n_tugs, device=device, dtype=dtype)
+        if dtype == torch.float32:
+            # Position increments can be smaller than one float32 ULP at the
+            # operating coordinates. Keep pose accumulation precise while the
+            # velocity and actuator hot path remains float32.
+            tugs.eta = tugs.eta.to(torch.float64)
         return cls(
-            tugs=BatchedTugState.zeros(n_envs, n_tugs, device=device, dtype=dtype),
+            tugs=tugs,
             ships=BatchedShipState.zeros(n_envs, device=device, dtype=dtype),
             tug_params=BatchedTugParams.from_model(),
             device=device,
