@@ -51,20 +51,23 @@ class EnvConfig:
     ship_collision_dist_m: float = 6.0
 
     # ---------- 奖励 ----------
-    # R = w_dist*R_dist + w_hold*R_hold + w_vel*R_vel - w_coll*P_coll
-    #     - w_stall*P_stall + R_shape + R_team
+    # R = w_dist*R_progress - w_distance*C_distance + w_hold*R_hold
+    #     + w_vel*R_vel - w_coll*P_coll + R_team
     reward_dist_w: float = 3.0
+    reward_distance_cost_w: float = 0.2
     reward_hold_w: float = 2.0
     reward_velocity_w: float = 0.0
     reward_collision_w: float = 1.0
     reward_collision_cap: float = 2.0
+
+    # Compatibility-only switches; legacy shaping/stall is no longer computed by CPU rewards.
     reward_stall_w: float = 0.5
 
-    # 距离
-    reward_dist_progress_clip_m: float = 5.0
+    # 距离/目标切换
+    reward_dist_progress_clip_m: float = 1.0
     reward_dist_progress_frac: float = 0.7
-    reward_dist_scale_m: float = 500.0
-    reward_hold_start_m: float = 150.0
+    reward_dist_scale_m: float = 200.0
+    reward_hold_start_m: float = 150.0  # collision-corridor range only
     reward_hold_full_m: float = 20.0
 
     # 碰撞
@@ -83,8 +86,8 @@ class EnvConfig:
     reward_stall_min_progress_m: float = 2.0
     reward_stall_floor: float = 0.2
 
-    # 势函数 shaping
-    reward_shape_w: float = 0.3
+    # Compatibility-only switch; legacy shaping is no longer computed.
+    reward_shape_w: float = 0.0
     reward_shape_gamma: float = 0.99
     reward_shape_d_ref_m: float = 200.0
     reward_shape_clip: float = 1.0

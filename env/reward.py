@@ -1,13 +1,12 @@
 """拖船编队环境的稠密奖励。
 
 奖励结构:
-    R = w_dist * R_dist       (距离进度)
-      + w_hold * R_hold       (近场保持)
+    R = w_dist * R_progress   (距离进度)
+      - w_distance * C_distance (目标外距离成本)
+      + w_hold * R_hold       (目标内保持)
       + w_vel  * R_vel        (速度匹配)
       - w_coll * P_collision  (碰撞规避；船软碰可走廊软化)
-      - w_stall * P_stall     (停滞惩罚)
-      + R_shape               (势函数 shaping)
-      + R_team                (团队同步 softmin)
+      + R_team                (团队目标外距离成本)
 
 终端奖励由 FormationEnv.step 处理，不参与稠密归一化。
 """
@@ -120,8 +119,8 @@ class FormationRewardComputer:
             "r_dist": np.zeros(n, dtype=np.float32),
             "r_hold": np.zeros(n, dtype=np.float32),
             "r_velocity": np.zeros(n, dtype=np.float32),
-            "r_shape": np.zeros(n, dtype=np.float32),
             "r_team": np.zeros(n, dtype=np.float32),
+            "p_distance": np.zeros(n, dtype=np.float32),
             "p_collision": np.zeros(n, dtype=np.float32),
             "p_ship_collision": np.zeros(n, dtype=np.float32),
             "p_tug_collision": np.zeros(n, dtype=np.float32),
@@ -130,11 +129,8 @@ class FormationRewardComputer:
             "speed_err": np.zeros(n, dtype=np.float32),
             "hull_dist": np.zeros(n, dtype=np.float32),
             "in_zone": np.zeros(n, dtype=np.bool_),
-            "hold_gate": np.zeros(n, dtype=np.float32),
             "corridor_gate": np.zeros(n, dtype=np.float32),
             "ship_soft_scale": np.ones(n, dtype=np.float32),
-            "p_stall": np.zeros(n, dtype=np.float32),
-            "stall_scale": np.ones(n, dtype=np.float32),
         }
 
         ship_vx_w, ship_vy_w = state.ship.world_velocity()
@@ -143,22 +139,15 @@ class FormationRewardComputer:
 
         # --- config extraction ---
         w_dist = float(getattr(cfg, "reward_dist_w", 1.0))
+        distance_cost_w = max(float(getattr(cfg, "reward_distance_cost_w", 0.2)), 0.0)
         w_hold = float(getattr(cfg, "reward_hold_w", 1.0))
         w_vel = float(getattr(cfg, "reward_velocity_w", 0.25))
         w_coll = float(getattr(cfg, "reward_collision_w", 3.0))
-        w_stall = float(getattr(cfg, "reward_stall_w", 0.0))
         collision_cap = float(getattr(cfg, "reward_collision_cap", 1.5))
-        progress_clip = max(float(getattr(cfg, "reward_dist_progress_clip_m", 2.0)), 1e-6)
-        dist_progress_frac = float(np.clip(getattr(cfg, "reward_dist_progress_frac", 0.7), 0.0, 1.0))
-        stall_window_s = max(float(getattr(cfg, "reward_stall_window_s", 5.0)), 0.0)
-        stall_min_progress_m = max(float(getattr(cfg, "reward_stall_min_progress_m", 2.0)), 1e-6)
-        stall_floor = float(np.clip(getattr(cfg, "reward_stall_floor", 0.2), 0.0, 1.0))
-        dt_ctrl = max(float(getattr(cfg, "dt_ctrl", 0.2)), 1e-6)
-        stall_steps = max(1, int(math.ceil(stall_window_s / dt_ctrl))) if stall_window_s > 0.0 else 0
+        progress_clip = max(float(getattr(cfg, "reward_dist_progress_clip_m", 1.0)), 1e-6)
+        distance_scale = max(float(getattr(cfg, "reward_dist_scale_m", 200.0)), 1e-6)
+        target_tol = max(float(cfg.pos_tol_m), 1e-6)
         hold_start_m = max(float(getattr(cfg, "reward_hold_start_m", 120.0)), 1e-6)
-        hold_full_m = max(float(getattr(cfg, "reward_hold_full_m", 20.0)), 1e-6)
-        if hold_start_m < hold_full_m:
-            hold_start_m, hold_full_m = hold_full_m, hold_start_m
 
         speed_scale = max(float(getattr(cfg, "reward_velocity_speed_scale_ms", cfg.speed_tol_ms)), 1e-6)
         yaw_scale = max(float(getattr(cfg, "reward_velocity_yaw_scale_rads", 0.05)), 1e-6)
@@ -171,19 +160,8 @@ class FormationRewardComputer:
         corridor_axial_slack = max(float(getattr(cfg, "reward_corridor_axial_slack_m", 30.0)), 0.0)
         ship_soft_min = float(getattr(cfg, "reward_ship_soft_min_scale", 0.15))
 
-        # --- potential shaping ---
-        w_shape = float(getattr(cfg, "reward_shape_w", 0.0))
-        shape_gamma = float(getattr(cfg, "reward_shape_gamma", 0.99))
-        shape_d_ref = max(float(getattr(cfg, "reward_shape_d_ref_m", 200.0)), 1e-6)
-        shape_clip = max(float(getattr(cfg, "reward_shape_clip", 1.0)), 1e-6)
-
-        def _potential(dist: float, spd_err: float, head_err: float) -> float:
-            return -(0.6 * dist / shape_d_ref + 0.25 * spd_err / cfg.speed_tol_ms + 0.15 * head_err / cfg.heading_tol_rad)
-
         # --- team sync ---
         w_team = float(getattr(cfg, "reward_team_w", 0.0))
-        team_beta = max(float(getattr(cfg, "reward_team_softmin_beta", 4.0)), 1e-6)
-        z_in_zone = np.zeros(n, dtype=np.float64)
 
         for i, tug in enumerate(state.tugs):
             slot = slot_world[state.tug_to_slot[i]]
@@ -195,55 +173,22 @@ class FormationRewardComputer:
             dvy = tug_vy_w - ship_vy_w
             speed_err = math.hypot(dvx, dvy)
 
-            # -- distance progress --
+            target_x = float(np.clip(1.0 - d / target_tol, 0.0, 1.0))
+            target_gate = target_x * target_x * (3.0 - 2.0 * target_x)
             progress = float(np.clip((float(episode.prev_dist[i]) - d) / progress_clip, -1.0, 1.0))
-
-            # -- hold gate (smoothstep blend) --
-            if d <= hold_full_m:
-                gate = 1.0
-            elif d >= hold_start_m:
-                gate = 0.0
-            else:
-                blend = (hold_start_m - d) / max(hold_start_m - hold_full_m, 1e-6)
-                gate = float(blend * blend * (3.0 - 2.0 * blend))
-
-            # -- hold score --
-            pos_score = max(0.0, 1.0 - d / max(cfg.pos_tol_m, 1e-6))
+            r_dist = (1.0 - target_gate) * progress
+            p_distance = (1.0 - target_gate) * float(np.clip(d / distance_scale, 0.0, 1.0))
             head_score = max(0.0, 1.0 - abs(dpsi) / max(cfg.heading_tol_rad, 1e-6))
             speed_score = max(0.0, 1.0 - speed_err / max(cfg.speed_tol_ms, 1e-6))
-            hold_score = pos_score * (0.5 + 0.25 * head_score + 0.25 * speed_score)
+            r_hold = target_gate * (0.5 + 0.25 * head_score + 0.25 * speed_score)
 
             # -- in-zone tracking --
             in_zone_now = d < cfg.pos_tol_m and abs(dpsi) < cfg.heading_tol_rad and speed_err < cfg.speed_tol_ms
-            z_in_zone[i] = pos_score * head_score * speed_score
-
-            # -- reward components --
-            # 混合：进度为主 + 弱绝对距离；再乘停滞缩放
-            dist_bonus = 1.0 - d / max(float(getattr(cfg, "reward_dist_scale_m", 500.0)), 1e-6)
-            dist_bonus = float(np.clip(dist_bonus, -0.5, 1.0))
-            r_dist = (1.0 - gate) * (
-                dist_progress_frac * progress + (1.0 - dist_progress_frac) * dist_bonus
-            )
-            r_hold = gate * hold_score
-
-            stall_scale = 1.0
-            p_stall = 0.0
-            if gate < 0.99 and stall_steps > 0 and int(getattr(episode, "dist_hist_filled", 0)) >= stall_steps:
-                hist = episode.dist_hist
-                head = int(episode.dist_hist_head)
-                cap = int(hist.shape[1])
-                idx = (head - stall_steps) % cap
-                d_old = float(hist[i, idx])
-                delta = d_old - d
-                if delta < stall_min_progress_m:
-                    p_stall = float(np.clip((stall_min_progress_m - delta) / stall_min_progress_m, 0.0, 1.0))
-                    stall_scale = 1.0 - (1.0 - stall_floor) * p_stall
-            r_dist = r_dist * stall_scale
 
             speed_pen = 1.0 - math.exp(-((speed_err / speed_scale) ** 2))
             yaw_err = abs(tug.r - state.ship.r)
             yaw_pen = 1.0 - math.exp(-((yaw_err / yaw_scale) ** 2))
-            r_vel = -gate * (0.8 * speed_pen + 0.2 * yaw_pen)
+            r_vel = -target_gate * (0.8 * speed_pen + 0.2 * yaw_pen)
 
             # -- collision --
             d_hull = state.ship.distance_from_hull(tug.x, tug.y)
@@ -294,21 +239,13 @@ class FormationRewardComputer:
             p_tug = p_tug_prox + cpa_w * p_tug_cpa
             p_coll = min(p_ship + p_tug, collision_cap)
 
-            # -- shaping --
-            r_shape = 0.0
-            if w_shape > 0.0:
-                phi_cur = _potential(d, speed_err, abs(dpsi))
-                phi_prev = _potential(float(episode.prev_dist[i]), float(episode.prev_speed_err[i]), float(episode.prev_heading_err[i]))
-                r_shape = w_shape * float(np.clip(shape_gamma * phi_cur - phi_prev, -shape_clip, shape_clip))
-
             # -- total --
             r_total = (
                 w_dist * r_dist
+                - distance_cost_w * p_distance
                 + w_hold * r_hold
                 + w_vel * r_vel
                 - w_coll * p_coll
-                - w_stall * p_stall
-                + r_shape
             )
             rewards[i] = r_total
 
@@ -323,26 +260,27 @@ class FormationRewardComputer:
             comp["r_dist"][i] = r_dist
             comp["r_hold"][i] = r_hold
             comp["r_velocity"][i] = r_vel
-            comp["r_shape"][i] = r_shape
+            comp["p_distance"][i] = p_distance
             comp["p_collision"][i] = p_coll
             comp["p_ship_collision"][i] = p_ship
             comp["p_tug_collision"][i] = p_tug
-            comp["p_stall"][i] = p_stall
-            comp["stall_scale"][i] = stall_scale
             comp["dist_to_slot"][i] = d
             comp["heading_err_deg"][i] = math.degrees(abs(dpsi))
             comp["speed_err"][i] = speed_err
             comp["hull_dist"][i] = d_hull
             comp["in_zone"][i] = in_zone_now
-            comp["hold_gate"][i] = gate
             comp["corridor_gate"][i] = c_gate
             comp["ship_soft_scale"][i] = soft
 
-        # -- team sync bonus --
+        # -- team distance cost --
         if w_team > 0.0:
-            team_softmin = float(-np.log(np.mean(np.exp(-team_beta * z_in_zone))) / team_beta)
-            rewards += np.float32(w_team * team_softmin)
-            comp["r_total"] += np.float32(w_team * team_softmin)
-            comp["r_team"][:] = np.float32(w_team * team_softmin)
+            beta = max(float(getattr(cfg, "reward_team_softmin_beta", 4.0)), 1e-6)
+            logits = beta * np.asarray(comp["p_distance"], dtype=np.float64)
+            weights = np.exp(logits - float(np.max(logits)))
+            team_cost = float(np.dot(weights, comp["p_distance"]) / max(float(weights.sum()), 1e-12))
+            team_reward = np.float32(-w_team * team_cost)
+            rewards += team_reward
+            comp["r_total"] += team_reward
+            comp["r_team"][:] = team_reward
 
         return rewards, {"reward_components": comp}
