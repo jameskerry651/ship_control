@@ -120,16 +120,9 @@ class FormationEnv:
         self.last_init_diagnostics = {}
 
         # MutableEpisodeState 替代原来的散落字段
-        dist_hist_cap = self._dist_hist_cap()
         self._episode = MutableEpisodeState(
             in_zone_steps=np.zeros(self.n_tugs, dtype=np.int32),
             prev_dist=np.zeros(self.n_tugs, dtype=np.float32),
-            prev_d_hull=np.zeros(self.n_tugs, dtype=np.float32),
-            prev_speed_err=np.zeros(self.n_tugs, dtype=np.float32),
-            prev_heading_err=np.zeros(self.n_tugs, dtype=np.float32),
-            dist_hist=np.zeros((self.n_tugs, dist_hist_cap), dtype=np.float32),
-            dist_hist_head=0,
-            dist_hist_filled=0,
             capture_done=False,
             just_captured=False,
             phase="approach",
@@ -141,29 +134,6 @@ class FormationEnv:
 
         self._obs = Observer()
         self._reward = FormationRewardComputer()
-
-    def _dist_hist_cap(self) -> int:
-        window_s = float(getattr(self.cfg, "reward_stall_window_s", 5.0))
-        dt = max(float(self.cfg.dt_ctrl), 1e-6)
-        return max(2, int(math.ceil(window_s / dt)) + 1)
-
-    def _reset_dist_hist(self) -> None:
-        cap = self._dist_hist_cap()
-        self._episode.dist_hist = np.zeros((self.n_tugs, cap), dtype=np.float32)
-        self._episode.dist_hist_head = 0
-        self._episode.dist_hist_filled = 0
-
-    def _push_dist_hist(self, dists: np.ndarray) -> None:
-        ep = self._episode
-        cap = int(ep.dist_hist.shape[1])
-        if ep.dist_hist.shape[0] != self.n_tugs or cap != self._dist_hist_cap():
-            self._reset_dist_hist()
-            ep = self._episode
-            cap = int(ep.dist_hist.shape[1])
-        h = int(ep.dist_hist_head)
-        ep.dist_hist[:, h] = np.asarray(dists, dtype=np.float32)
-        ep.dist_hist_head = (h + 1) % cap
-        ep.dist_hist_filled = min(int(ep.dist_hist_filled) + 1, cap)
 
     # ----------------------------------------------------------- properties
 
@@ -237,8 +207,6 @@ class FormationEnv:
         self.motion_history[:] = 0.0
         self.action_history[:] = 0.0
         self._episode.in_zone_steps[:] = 0
-        self._episode.prev_d_hull[:] = 0.0
-        self._reset_dist_hist()
         self._episode.capture_done = False
         self._episode.just_captured = False
         self._episode.phase = "approach"
@@ -288,10 +256,6 @@ class FormationEnv:
         for i, tug in enumerate(self.tugs):
             slot = slot_world[self.tug_to_slot[i]]
             self._episode.prev_dist[i] = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
-            self._episode.prev_d_hull[i] = self.ship.distance_from_hull(tug.eta.x, tug.eta.y)
-            spd_err, head_err = self._tug_track_errors(tug, slot)
-            self._episode.prev_speed_err[i] = spd_err
-            self._episode.prev_heading_err[i] = head_err
 
         state = self._build_sim_state()
         return Observer.build_obs(
@@ -361,18 +325,10 @@ class FormationEnv:
 
         self.last_actions = actions.copy()
         Observer.append_obs_history(self.motion_history, self.action_history, self.tugs, actions, prev_nu)
-        cur_dists = np.zeros(self.n_tugs, dtype=np.float32)
         for i, tug in enumerate(self.tugs):
             slot = slot_world[self.tug_to_slot[i]]
             d_now = float(math.hypot(tug.eta.x - slot[0], tug.eta.y - slot[1]))
-            cur_dists[i] = d_now
             self._episode.prev_dist[i] = d_now
-            self._episode.prev_d_hull[i] = self.ship.distance_from_hull(tug.eta.x, tug.eta.y)
-            spd_err, head_err = self._tug_track_errors(tug, slot)
-            self._episode.prev_speed_err[i] = spd_err
-            self._episode.prev_heading_err[i] = head_err
-        # Push after reward so stall window reads prior distances only.
-        self._push_dist_hist(cur_dists)
 
         obs = Observer.build_obs(
             state, self.motion_history, self.action_history, self.observation_spec
@@ -396,21 +352,6 @@ class FormationEnv:
             tug_to_slot=self.tug_to_slot.copy(),
             last_actions=self.last_actions.copy(),
         )
-
-    def _tug_track_errors(self, tug, slot) -> tuple[float, float]:
-        """单艇相对大船的速度误差与航向误差（P3 势函数 shaping 用，单一来源避免公式重复）。"""
-        cs = math.cos(self.ship.psi)
-        sn = math.sin(self.ship.psi)
-        ship_vx = cs * self.ship.u - sn * self.ship.v
-        ship_vy = sn * self.ship.u + cs * self.ship.v
-        ci = math.cos(tug.eta.z)
-        si = math.sin(tug.eta.z)
-        tug_vx = ci * tug.nu.x - si * tug.nu.y
-        tug_vy = si * tug.nu.x + ci * tug.nu.y
-        speed_err = math.hypot(tug_vx - ship_vx, tug_vy - ship_vy)
-        dpsi = float(slot[2]) - tug.eta.z
-        dpsi = math.atan2(math.sin(dpsi), math.cos(dpsi))
-        return speed_err, abs(dpsi)
 
     # ----------------------------------------------------- observation / state
 

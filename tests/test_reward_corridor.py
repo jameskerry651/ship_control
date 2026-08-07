@@ -14,8 +14,6 @@ from physics.tugboat_dynamics_model import Vec3
 
 def _env() -> FormationEnv:
     cfg = EnvConfig()
-    cfg.reward_stall_w = 0.0  # isolate corridor
-    cfg.reward_shape_w = 0.0
     cfg.reward_team_w = 0.0
     env = FormationEnv(cfg=cfg, seed=3)
     env.reset()

@@ -43,12 +43,6 @@ class BatchedEpisodeState:
 
     in_zone_steps: torch.Tensor
     prev_dist: torch.Tensor
-    prev_d_hull: torch.Tensor
-    prev_speed_err: torch.Tensor
-    prev_heading_err: torch.Tensor
-    dist_hist: torch.Tensor
-    dist_hist_head: torch.Tensor
-    dist_hist_filled: torch.Tensor
     capture_done: torch.Tensor
     just_captured: torch.Tensor
     track_streak_steps: torch.Tensor
@@ -87,17 +81,10 @@ class FastBatchedStep:
         self.spec = spec
         self.device = batch.device
         self.dtype = batch.dtype
-        hist_cap = max(2, int(math.ceil(float(cfg.reward_stall_window_s) / max(float(cfg.dt_ctrl), 1e-6))) + 1)
         z = lambda *shape, dtype=None: torch.zeros(*shape, device=self.device, dtype=dtype or self.dtype)
         self.episode = BatchedEpisodeState(
             in_zone_steps=z(n_envs, n_tugs, dtype=torch.int64),
             prev_dist=z(n_envs, n_tugs),
-            prev_d_hull=z(n_envs, n_tugs),
-            prev_speed_err=z(n_envs, n_tugs),
-            prev_heading_err=z(n_envs, n_tugs),
-            dist_hist=z(n_envs, n_tugs, hist_cap),
-            dist_hist_head=z(n_envs, dtype=torch.int64),
-            dist_hist_filled=z(n_envs, dtype=torch.int64),
             capture_done=z(n_envs, dtype=torch.bool),
             just_captured=z(n_envs, dtype=torch.bool),
             track_streak_steps=z(n_envs, dtype=torch.int64),
@@ -117,12 +104,6 @@ class FastBatchedStep:
         e = self.episode
         e.in_zone_steps[row].copy_(_tensor_like(ep.in_zone_steps, e.in_zone_steps, dtype=torch.int64))
         e.prev_dist[row].copy_(_tensor_like(ep.prev_dist, e.prev_dist))
-        e.prev_d_hull[row].copy_(_tensor_like(ep.prev_d_hull, e.prev_d_hull))
-        e.prev_speed_err[row].copy_(_tensor_like(ep.prev_speed_err, e.prev_speed_err))
-        e.prev_heading_err[row].copy_(_tensor_like(ep.prev_heading_err, e.prev_heading_err))
-        e.dist_hist[row].zero_()
-        e.dist_hist_head[row] = 0
-        e.dist_hist_filled[row] = 0
         e.capture_done[row] = False
         e.just_captured[row] = False
         e.track_streak_steps[row] = 0
@@ -423,16 +404,6 @@ class FastBatchedStep:
         # Legacy episode arrays are float32 even when batched dynamics is
         # float64; quantizing these tracked values is required for exact L2.
         ep.prev_dist.copy_(derived["dist"].to(torch.float32))
-        ep.prev_d_hull.copy_(derived["hull_dist"].to(torch.float32))
-        ep.prev_speed_err.copy_(derived["speed_err"].to(torch.float32))
-        ep.prev_heading_err.copy_(derived["heading_err"].abs().to(torch.float32))
-        cap = ep.dist_hist.shape[-1]
-        ep.dist_hist.scatter_(
-            2, ep.dist_hist_head[:, None, None].expand(-1, self.n_tugs, 1),
-            derived["dist"].to(torch.float32).to(self.dtype)[..., None]
-        )
-        ep.dist_hist_head = (ep.dist_hist_head + 1) % cap
-        ep.dist_hist_filled = (ep.dist_hist_filled + 1).clamp_max(cap)
 
     # ------------------------------------------------------------- observer
     def build_obs_batched(self, derived: dict[str, torch.Tensor] | None = None) -> torch.Tensor:

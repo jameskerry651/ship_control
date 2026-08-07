@@ -7,8 +7,14 @@ from env.formation_env import FormationEnv
 
 
 REQUIRED = {
-    "r_total", "r_dist", "r_hold", "p_collision", "p_stall",
-    "corridor_gate", "ship_soft_scale", "stall_scale", "hold_gate",
+    "r_total",
+    "r_dist",
+    "p_distance",
+    "r_hold",
+    "r_team",
+    "p_collision",
+    "corridor_gate",
+    "ship_soft_scale",
 }
 
 

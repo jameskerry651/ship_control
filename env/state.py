@@ -276,12 +276,6 @@ class MutableEpisodeState:
     """
     in_zone_steps: np.ndarray           # (n_tugs,) int
     prev_dist: np.ndarray               # (n_tugs,)
-    prev_d_hull: np.ndarray             # (n_tugs,)
-    prev_speed_err: np.ndarray          # (n_tugs,)
-    prev_heading_err: np.ndarray        # (n_tugs,)
-    dist_hist: np.ndarray               # (n_tugs, hist_cap) slot-distance ring buffer
-    dist_hist_head: int = 0             # next write index
-    dist_hist_filled: int = 0           # valid length <= hist_cap
     # Capture / Track 阶段
     capture_done: bool = False          # 是否已完成短时入位（hold_time）
     just_captured: bool = False         # 本步是否刚触发 capture（发一次 bonus）
