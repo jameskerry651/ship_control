@@ -73,12 +73,12 @@ tensorboard --logdir runs
 
 | 指标 | 含义 | 如何读 |
 |------|------|--------|
-| `r_dist` | 距离/接近相关奖励（进度为主 + 弱绝对靠近，含 stall_scale） | Approach 阶段应有贡献；入位后 gate 切向 hold，此项变弱属正常 |
-| `r_hold` | 站位保持分（位置/航向/速度综合，近距开启） | Capture/Track 阶段应上升或维持 |
-| `p_collision` | 碰撞风险惩罚项（势垒 + CPA，船项可走廊软化；非负） | 越小越好；升高常伴随 `collision_rate` 变差 |
-| `p_stall` | 停滞惩罚项（乘权重前；Hold 区为 0） | 长期打满却不靠近 → 假阳性/刷分；应随净接近下降 |
+| `r_dist` | 单步有符号接近进度（乘权重前） | 接近为正、等距为 0、远离为负；10 m 内平滑退出 |
+| `p_distance` | 非负目标距离代价（乘权重前） | 外围应较高，接近目标持续下降；静止仍会产生代价 |
+| `r_hold` | 10 m 目标区内的位置/航向/速度保持分 | Capture/Track 阶段应上升并维持 |
+| `p_collision` | 势垒与 CPA 碰撞风险；船项可走廊软化 | 越小越好；结合 collision rate 判断安全性 |
 
-总步奖励还含 shaping、team、终端奖罚等，**未全部写入 TensorBoard**；上表只保留读训练最有用的项。
+总步奖励还含 team、速度项、终端奖罚等，**未全部写入 TensorBoard**；上表只保留读训练最有用的项。
 
 ---
 
@@ -87,7 +87,7 @@ tensorboard --logdir runs
 1. `eval/success_rate`、`eval/capture_rate`、`eval/collision_rate`、`eval/final_dist_mean`
 2. 对照 `rollout/` 是否同向（噪声更大）
 3. `loss/explained_variance`、`loss/approx_kl`、`loss/entropy` 看训练是否健康
-4. `reward/r_dist`、`reward/r_hold`、`reward/p_collision`、`reward/p_stall` 看卡在接近、跟随、避碰还是外围停滞
+4. `reward/r_dist`、`reward/p_distance`、`reward/r_hold`、`reward/p_collision` 看卡在接近、跟随、避碰还是外围停滞
 
 ---
 
