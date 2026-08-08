@@ -89,7 +89,7 @@ class RewardNormalizer:
 
 
 # TensorBoard 只记核心曲线：任务进度 + PPO 健康度 + 少量奖励分解
-_TB_REWARD_KEYS = ("r_dist", "p_distance", "r_hold", "p_collision")
+_TB_REWARD_KEYS = ("r_dist", "p_distance", "r_hold", "r_safe", "p_collision")
 _TB_EVAL_KEYS = (
     "eval/return_mean",
     "eval/success_rate",
@@ -99,8 +99,17 @@ _TB_EVAL_KEYS = (
     "eval/final_dist_mean",
 )
 
-from config import EnvConfig, PPOConfig, REWARD_PRESETS, apply_reward_preset, list_reward_presets
+from config import (
+    EnvConfig,
+    PPOConfig,
+    REWARD_PRESETS,
+    apply_reward_preset,
+    apply_tf_size_preset,
+    list_reward_presets,
+    list_tf_size_presets,
+)
 from env.formation_env import ACTION_DIM, FormationEnv
+from env.gpu.vec_env import CudaVecEnv
 from env.obs_spec import ObservationSpec
 from rl.ppo import MAPPOActorCritic, MAPPORolloutBuffer, mappo_update
 
@@ -799,6 +808,103 @@ def _run_batched_eval(
     return [result for result in result_slots if result is not None]
 
 
+def _run_cuda_batched_eval(
+    model: MAPPOActorCritic,
+    env_cfg: EnvConfig,
+    n_episodes: int,
+    seed: int,
+    n_envs: int,
+    device: torch.device,
+    runner: CudaVecEnv | None = None,
+) -> list[tuple[float, int, bool, bool, float, bool, float]]:
+    """CudaVecEnv 批仿真 + 同卡策略推理；不做自动 reset，由调度器显式 seed。"""
+    if device.type != "cuda":
+        raise ValueError("eval-backend cuda requires a CUDA device")
+    owns_runner = runner is None
+    if runner is None:
+        worker_count = min(int(n_envs), int(n_episodes))
+        runner = CudaVecEnv(
+            env_cfg,
+            n_envs=worker_count,
+            base_seed=seed,
+            device=device,
+        )
+    else:
+        if runner.n_envs > n_episodes:
+            raise ValueError("persistent cuda eval runner cannot have more envs than episodes")
+        worker_count = int(runner.n_envs)
+
+    result_slots: list[tuple[float, int, bool, bool, float, bool, float] | None] = [
+        None
+    ] * n_episodes
+    episode_ids = np.arange(worker_count, dtype=np.int64)
+    active = np.ones(worker_count, dtype=bool)
+    episode_returns = np.zeros(worker_count, dtype=np.float64)
+    episode_lengths = np.zeros(worker_count, dtype=np.int32)
+    next_episode_id = worker_count
+    action_dim = int(runner.envs_probe.action_dim)
+    idle_action = np.zeros((worker_count, env_cfg.n_tugs, action_dim), dtype=np.float32)
+
+    try:
+        obs_list = runner.reset_at(
+            np.arange(worker_count, dtype=np.int64),
+            [seed + i for i in range(worker_count)],
+        )
+        obs = np.stack(obs_list, axis=0)
+
+        while active.any():
+            with torch.no_grad():
+                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+                # 已结束槽位用零动作占位，避免改变仍活跃 env 的批形状。
+                flat_obs = obs_t.reshape(-1, obs_t.shape[-1])
+                action, _, _ = model.act(flat_obs, deterministic=True)
+                action_np = action.reshape(worker_count, env_cfg.n_tugs, -1).cpu().numpy()
+            action_np = np.where(active[:, None, None], action_np, idle_action)
+
+            step_out = runner.step(action_np, auto_reset=False)
+            next_obs, rew, done, infos = step_out[0], step_out[1], step_out[2], step_out[3]
+
+            resets: list[tuple[int, int]] = []
+            for env_idx in range(worker_count):
+                if not active[env_idx]:
+                    continue
+                episode_returns[env_idx] += float(np.asarray(rew[env_idx]).mean())
+                episode_lengths[env_idx] += 1
+                if bool(done[env_idx]):
+                    episode_id = int(episode_ids[env_idx])
+                    result_slots[episode_id] = _eval_result_from_info(
+                        episode_returns[env_idx],
+                        episode_lengths[env_idx],
+                        infos[env_idx],
+                    )
+                    if next_episode_id < n_episodes:
+                        episode_ids[env_idx] = next_episode_id
+                        resets.append((env_idx, seed + next_episode_id))
+                        next_episode_id += 1
+                    else:
+                        active[env_idx] = False
+                else:
+                    obs[env_idx] = next_obs[env_idx]
+
+            if resets:
+                reset_indices = np.asarray([item[0] for item in resets], dtype=np.int64)
+                reset_obs = runner.reset_at(
+                    reset_indices, [item[1] for item in resets]
+                )
+                for env_idx_raw, obs_i in zip(reset_indices, reset_obs):
+                    env_idx = int(env_idx_raw)
+                    obs[env_idx] = obs_i
+                    episode_returns[env_idx] = 0.0
+                    episode_lengths[env_idx] = 0
+    finally:
+        if owns_runner:
+            runner.close()
+
+    if any(result is None for result in result_slots):
+        raise RuntimeError("cuda evaluation ended before all episodes completed")
+    return [result for result in result_slots if result is not None]
+
+
 def evaluate_policy(
     model: MAPPOActorCritic,
     env_cfg: EnvConfig,
@@ -807,31 +913,49 @@ def evaluate_policy(
     seed: int = 12345,
     *,
     eval_workers: int = 1,
+    eval_backend: Literal["cpu", "cuda"] = "cpu",
     model_kwargs: dict[str, Any] | None = None,
-    eval_runner: _BatchedEvalEnv | None = None,
+    eval_runner: _BatchedEvalEnv | CudaVecEnv | None = None,
 ) -> dict[str, float]:
     if model_kwargs is None:
         raise ValueError("model_kwargs is required for evaluate_policy")
 
     if n_episodes <= 0:
         raise ValueError("n_episodes must be positive")
+    backend = str(eval_backend).strip().lower()
+    if backend not in ("cpu", "cuda"):
+        raise ValueError(f"unknown eval_backend {eval_backend!r}")
+    if backend == "cuda" and device.type != "cuda":
+        raise ValueError("eval-backend cuda requires a CUDA device")
 
     was_training = model.training
     model.eval()
     try:
-        if eval_workers <= 1:
+        if backend == "cuda":
+            cuda_runner = eval_runner if isinstance(eval_runner, CudaVecEnv) else None
+            results = _run_cuda_batched_eval(
+                model,
+                env_cfg,
+                n_episodes=n_episodes,
+                seed=seed,
+                n_envs=max(1, int(eval_workers)),
+                device=device,
+                runner=cuda_runner,
+            )
+        elif eval_workers <= 1:
             results = [
                 _run_eval_episode_with_model(seed + i, env_cfg, model)
                 for i in range(n_episodes)
             ]
         else:
+            cpu_runner = eval_runner if isinstance(eval_runner, _BatchedEvalEnv) else None
             results = _run_batched_eval(
                 model,
                 env_cfg,
                 n_episodes=n_episodes,
                 seed=seed,
                 n_envs=eval_workers,
-                runner=eval_runner,
+                runner=cpu_runner,
             )
     finally:
         model.train(was_training)
@@ -934,13 +1058,29 @@ def main() -> None:
         choices=["mlp", "transformer", "gru", "lstm"],
         help="Actor 时序架构（默认 PPOConfig.actor_arch；gru/lstm 预留未实现）",
     )
+    parser.add_argument(
+        "--tf-size",
+        type=str,
+        default=None,
+        help=(
+            "Transformer actor 规模 preset（config.TF_SIZE_PRESETS）；"
+            f"可选: {', '.join(list_tf_size_presets())}"
+        ),
+    )
     parser.add_argument("--env-backend", type=str, default=PPOConfig.env_backend,
                         choices=["sync", "subproc", "cuda"],
                         help="rollout 环境后端：默认 cuda（GPU 批动力学）；弱机器用 sync/subproc")
     parser.add_argument("--env-workers", type=int, default=None,
                         help="subproc 环境进程数（默认等于 --num-envs）")
     parser.add_argument("--eval-workers", type=int, default=PPOConfig.eval_workers,
-                        help="并行评估环境数；策略在主进程按 batch 推理")
+                        help="并行评估环境数；cuda eval 为 CudaVecEnv 宽度，cpu eval>1 为子进程数")
+    parser.add_argument(
+        "--eval-backend",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda"],
+        help="评估环境后端：cuda=CudaVecEnv（默认随 --device）；cpu=FormationEnv",
+    )
     parser.add_argument("--eval-interval", type=int, default=PPOConfig.eval_interval,
                         help="每多少个 PPO update 执行一次评估")
     parser.add_argument("--eval-episodes", type=int, default=PPOConfig.eval_episodes,
@@ -1002,6 +1142,11 @@ def main() -> None:
         eval_episodes=int(args.eval_episodes),
         eval_workers=eval_workers,
     )
+    tf_size_id: str | None = None
+    try:
+        tf_size_id = apply_tf_size_preset(ppo_cfg, args.tf_size)
+    except ValueError as exc:
+        raise SystemExit(f"[tf] {exc}") from exc
 
     # 随机种子
     np.random.seed(ppo_cfg.seed)
@@ -1009,6 +1154,13 @@ def main() -> None:
 
     # 设备
     device = torch.device(ppo_cfg.device)
+    eval_backend: Literal["cpu", "cuda"] = (
+        str(args.eval_backend).strip().lower()  # type: ignore[assignment]
+        if args.eval_backend is not None
+        else ("cuda" if device.type == "cuda" else "cpu")
+    )
+    if eval_backend == "cuda" and device.type != "cuda":
+        raise SystemExit("[eval] --eval-backend cuda 需要 --device cuda")
 
     # 运行名与目录
     run_name = args.run_name or time.strftime("mappo_tug_%Y%m%d_%H%M%S")
@@ -1037,6 +1189,7 @@ def main() -> None:
         f"(pos_tol={env_cfg.pos_tol_m:.1f}m)"
     )
     print(f"[init] actor_arch = {ppo_cfg.actor_arch}")
+    print(f"[init] eval_backend = {eval_backend}, eval_workers = {eval_workers}")
     if reward_preset_id is not None:
         overrides = dict(REWARD_PRESETS[reward_preset_id])
         print(f"[reward] preset = {reward_preset_id}, overrides = {overrides}")
@@ -1045,9 +1198,12 @@ def main() -> None:
     print(
         f"[reward] dist_w={env_cfg.reward_dist_w}, "
         f"distance_cost_w={env_cfg.reward_distance_cost_w}, "
-        f"dist_scale_m={env_cfg.reward_dist_scale_m}, "
-        f"ship_safe_m={env_cfg.reward_collision_ship_safe_m}, "
+        f"safe_w={env_cfg.reward_safe_w}, "
+        f"hold_w={env_cfg.reward_hold_w}, "
+        f"progress_risk_gate={env_cfg.reward_progress_risk_gate}, "
+        f"ship_soft_min={env_cfg.reward_ship_soft_min_scale}, "
         f"coll_w={env_cfg.reward_collision_w}, "
+        f"coll_cap={env_cfg.reward_collision_cap}, "
         f"cpa_w={env_cfg.reward_collision_cpa_w}"
     )
     if int(args.critic_warmup_updates) > 0:
@@ -1055,9 +1211,14 @@ def main() -> None:
               "(actor frozen, eval/best skipped during warmup)")
 
     # 把超参数 dump 到 tensorboard 与文本
-    hparams_text = "\n".join([f"env.{k} = {v}" for k, v in asdict(env_cfg).items()] +
-                             [f"ppo.{k} = {v}" for k, v in asdict(ppo_cfg).items()] +
-                             [f"reward_preset = {reward_preset_id or ''}"])
+    hparams_text = "\n".join(
+        [f"env.{k} = {v}" for k, v in asdict(env_cfg).items()]
+        + [f"ppo.{k} = {v}" for k, v in asdict(ppo_cfg).items()]
+        + [
+            f"reward_preset = {reward_preset_id or ''}",
+            f"tf_size = {tf_size_id or ''}",
+        ]
+    )
     writer.add_text("hparams", hparams_text.replace("\n", "  \n"), 0)
 
     # 向量化环境
@@ -1102,6 +1263,13 @@ def main() -> None:
         "tf_dropout": ppo_cfg.tf_dropout,
     }
     model = MAPPOActorCritic(**model_kwargs).to(device)
+    actor_params = sum(p.numel() for p in model.actor.parameters())
+    print(
+        f"[tf] size={tf_size_id or '(default)'}, "
+        f"d_model={ppo_cfg.tf_d_model}, nhead={ppo_cfg.tf_nhead}, "
+        f"layers={ppo_cfg.tf_num_layers}, ffn={ppo_cfg.tf_ffn_dim}, "
+        f"actor_params={actor_params}"
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=ppo_cfg.learning_rate, eps=1e-5)
 
     # 续训
@@ -1186,12 +1354,22 @@ def main() -> None:
         interrupt_flag["stop"] = True
     signal.signal(signal.SIGINT, _on_sigint)
 
-    eval_runner = (
-        _BatchedEvalEnv(env_cfg, min(eval_workers, ppo_cfg.eval_episodes))
-        if eval_workers > 1
-        else None
-    )
-    if eval_runner is not None:
+    eval_runner: _BatchedEvalEnv | CudaVecEnv | None = None
+    if eval_backend == "cuda":
+        eval_runner = CudaVecEnv(
+            env_cfg,
+            n_envs=min(eval_workers, ppo_cfg.eval_episodes),
+            base_seed=ppo_cfg.seed + 10_000,
+            device=device,
+        )
+        print(
+            f"[init] persistent cuda eval: {eval_runner.n_envs} CudaVecEnv + "
+            f"CUDA policy inference"
+        )
+    elif eval_workers > 1:
+        eval_runner = _BatchedEvalEnv(
+            env_cfg, min(eval_workers, ppo_cfg.eval_episodes)
+        )
         print(
             f"[init] persistent batched eval: {eval_runner.n_envs} CPU envs + "
             f"{device.type.upper()} policy inference"
@@ -1432,6 +1610,7 @@ def main() -> None:
                 model, env_cfg, n_episodes=ppo_cfg.eval_episodes,
                 device=device, seed=ppo_cfg.seed + 9999 + update,
                 eval_workers=eval_workers,
+                eval_backend=eval_backend,
                 model_kwargs=model_kwargs,
                 eval_runner=eval_runner,
             )
@@ -1519,6 +1698,7 @@ def main() -> None:
                     update=update + 1, global_step=global_step,
                     metric=cur_succ,
                     lr_scheduler=lr_scheduler,
+                    tf_size=tf_size_id,
                 )
                 print(f"  [save] best.pt updated (succ={cur_succ*100:.1f}%, "
                       f"coll={cur_coll*100:.1f}%, d={cur_dist:.1f}m, "
@@ -1541,6 +1721,7 @@ def main() -> None:
                 update=update + 1, global_step=global_step,
                 metric=recent_ret,
                 lr_scheduler=lr_scheduler,
+                tf_size=tf_size_id,
             )
 
         if lr_scheduler is not None:
@@ -1558,6 +1739,7 @@ def main() -> None:
         update=last_completed_update, global_step=global_step,
         metric=float(np.mean(ep_return_window)) if ep_return_window else 0.0,
         lr_scheduler=lr_scheduler,
+        tf_size=tf_size_id,
     )
     if eval_runner is not None:
         eval_runner.close()
@@ -1582,6 +1764,7 @@ def _save_ckpt(
     global_step: int,
     metric: float,
     lr_scheduler: LRScheduler | None = None,
+    tf_size: str | None = None,
 ) -> None:
     payload = {
         "algo": "mappo",
@@ -1604,6 +1787,7 @@ def _save_ckpt(
         "env_cfg": asdict(env_cfg),
         "ppo_cfg": asdict(ppo_cfg),
         "observation_spec": model.observation_spec.to_dict(),
+        "tf_size": tf_size or "",
         "update": update,
         "global_step": global_step,
         "metric": metric,

@@ -262,7 +262,10 @@ class FastBatchedStep:
         )
         ship_active = tcpa_ship <= horizon
         ship_risk = self._barrier(future_hull, float(cfg.ship_collision_dist_m), ship_safe) * (1.0 - tcpa_ship / horizon).clamp(0.0, 1.0)
-        p_ship = p_ship + cpa_w * torch.where(ship_active, ship_risk, torch.zeros_like(ship_risk))
+        p_ship_raw = p_ship + cpa_w * torch.where(ship_active, ship_risk, torch.zeros_like(ship_risk))
+        risk_gate = max(float(getattr(cfg, "reward_progress_risk_gate", 0.5)), 1e-6)
+        progress_risk = (p_ship_raw / risk_gate).clamp(0.0, 1.0)
+        r_dist = torch.where(r_dist > 0.0, r_dist * (1.0 - progress_risk), r_dist)
 
         slot_to_tug_x = t.eta[..., 0] - d["slots"][..., 0]
         slot_to_tug_y = t.eta[..., 1] - d["slots"][..., 1]
@@ -272,14 +275,25 @@ class FastBatchedStep:
         ex, ey = axis_x / axis_norm.clamp_min(1e-6), axis_y / axis_norm.clamp_min(1e-6)
         axial = slot_to_tug_x * ex + slot_to_tug_y * ey
         lateral = torch.hypot(slot_to_tug_x - axial * ex, slot_to_tug_y - axial * ey)
-        lateral_u = (1.0 - lateral / max(float(cfg.reward_corridor_half_width_m), 1e-6)).clamp(0.0, 1.0)
+        lat_n = (lateral / max(float(cfg.reward_corridor_half_width_m), 1e-6)).clamp(0.0, 1.0)
+        lateral_u = (1.0 - lat_n).clamp(0.0, 1.0)
         corridor = lateral_u.square() * (3.0 - 2.0 * lateral_u)
         corridor = torch.where(
             (dist < hold_start) & (axis_norm > 1e-6) & (axial >= -max(float(cfg.reward_corridor_axial_slack_m), 0.0)),
             corridor, torch.zeros_like(corridor),
         )
         soft = 1.0 - (1.0 - float(np.clip(cfg.reward_ship_soft_min_scale, 0.0, 1.0))) * corridor
-        p_ship = p_ship * soft
+        p_ship = p_ship_raw * soft
+
+        s_axial = progress.clamp(0.0, 1.0)
+        s_lat = 1.0 - lat_n.square() * (3.0 - 2.0 * lat_n)
+        u_x = s.x[:, None] - t.eta[..., 0]
+        u_y = s.y[:, None] - t.eta[..., 1]
+        u_n = torch.hypot(u_x, u_y).clamp_min(1e-6)
+        closing = (d["tug_vx"] * (u_x / u_n) + d["tug_vy"] * (u_y / u_n)).clamp_min(0.0)
+        v_ref = max(float(getattr(cfg, "reward_safe_closing_speed_mps", 1.0)), 1e-6)
+        s_approach = (1.0 - closing / v_ref).clamp(0.0, 1.0)
+        r_safe = corridor * (1.0 - target_gate) * (0.5 * s_axial + 0.3 * s_lat + 0.2 * s_approach)
 
         px = t.eta[..., 0]
         py = t.eta[..., 1]
@@ -298,6 +312,7 @@ class FastBatchedStep:
         rewards = (
             float(cfg.reward_dist_w) * r_dist
             - max(float(cfg.reward_distance_cost_w), 0.0) * p_distance
+            + float(getattr(cfg, "reward_safe_w", 0.0)) * r_safe
             + float(cfg.reward_hold_w) * r_hold
             + float(cfg.reward_velocity_w) * r_vel
             - float(cfg.reward_collision_w) * p_coll
@@ -321,11 +336,13 @@ class FastBatchedStep:
             "r_dist": r_dist.to(self.dtype),
             "p_distance": p_distance.to(self.dtype),
             "r_hold": r_hold.to(self.dtype),
+            "r_safe": r_safe.to(self.dtype),
             "r_velocity": r_vel.to(self.dtype),
             "r_team": r_team.expand(-1, self.n_tugs).to(self.dtype),
             "p_collision": p_coll.to(self.dtype),
             "p_ship_collision": p_ship.to(self.dtype),
             "p_tug_collision": p_tug.to(self.dtype),
+            "progress_risk": progress_risk.to(self.dtype),
             "dist_to_slot": dist.to(self.dtype),
             "heading_err_deg": (dpsi.abs() * (180.0 / math.pi)).to(self.dtype),
             "speed_err": speed_err.to(self.dtype),

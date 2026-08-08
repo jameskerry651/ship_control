@@ -1,12 +1,13 @@
 """拖船编队环境的稠密奖励。
 
 奖励结构:
-    R = w_dist * R_progress   (距离进度)
-      - w_distance * C_distance (目标外距离成本)
-      + w_hold * R_hold       (目标内保持)
-      + w_vel  * R_vel        (速度匹配)
-      - w_coll * P_collision  (碰撞规避；船软碰可走廊软化)
-      + R_team                (团队目标外距离成本)
+    R = w_dist * R_progress_gated  (风险门控后的距离进度)
+      - w_distance * C_distance    (目标外距离成本)
+      + w_safe * R_safe            (走廊安全进槽)
+      + w_hold * R_hold            (目标内保持)
+      + w_vel  * R_vel             (速度匹配)
+      - w_coll * P_collision       (碰撞规避；船软碰可走廊软化)
+      + R_team                     (团队目标外距离成本)
 
 终端奖励由 FormationEnv.step 处理，不参与稠密归一化。
 """
@@ -56,7 +57,61 @@ class FormationRewardComputer:
         return cls._barrier(dcpa, collision_distance, safe_distance) * time_weight
 
     @staticmethod
+    def _smoothstep01(x: float) -> float:
+        x = float(np.clip(x, 0.0, 1.0))
+        return x * x * (3.0 - 2.0 * x)
+
+    @classmethod
+    def _corridor_metrics(
+        cls,
+        tx: float,
+        ty: float,
+        slot_x: float,
+        slot_y: float,
+        ship_x: float,
+        ship_y: float,
+        d: float,
+        hold_start_m: float,
+        half_width_m: float,
+        axial_slack_m: float,
+    ) -> tuple[float, float]:
+        """Return ``(corridor_gate, lat_n)`` along the ship→slot axis.
+
+        Axis ``e`` is the fixed unit vector from ship through slot. ``r`` is
+        slot→tug; ``a = r·e`` is outboard when positive. Overshoot past the slot
+        toward the hull is allowed up to ``axial_slack_m`` (``a >= -slack``).
+        ``lat_n`` is lateral offset / half_width (unclipped before gate logic).
+        """
+        if d >= hold_start_m:
+            return 0.0, 1.0
+        if d <= 1e-6:
+            return 1.0, 0.0
+        ax = slot_x - ship_x
+        ay = slot_y - ship_y
+        axis_norm = math.hypot(ax, ay)
+        if axis_norm <= 1e-6:
+            return 0.0, 1.0
+        e_x = ax / axis_norm
+        e_y = ay / axis_norm
+        r_x = tx - slot_x
+        r_y = ty - slot_y
+        a = r_x * e_x + r_y * e_y
+        if a < -axial_slack_m:
+            return 0.0, 1.0
+        lat = math.hypot(r_x - a * e_x, r_y - a * e_y)
+        lat_n = lat / max(half_width_m, 1e-6)
+        if lat_n >= 1.0:
+            lat_gate = 0.0
+        elif lat_n <= 0.0:
+            lat_gate = 1.0
+        else:
+            u = 1.0 - lat_n
+            lat_gate = u * u * (3.0 - 2.0 * u)
+        return float(lat_gate), float(lat_n)
+
+    @classmethod
     def _corridor_gate(
+        cls,
         tx: float,
         ty: float,
         slot_x: float,
@@ -68,38 +123,11 @@ class FormationRewardComputer:
         half_width_m: float,
         axial_slack_m: float,
     ) -> float:
-        """Approach corridor gate in [0, 1] along the ship→slot axis.
-
-        Axis ``e`` is the fixed unit vector from ship through slot. ``r`` is
-        slot→tug; ``a = r·e`` is outboard when positive. Overshoot past the slot
-        toward the hull is allowed up to ``axial_slack_m`` (``a >= -slack``).
-        """
-        if d >= hold_start_m:
-            return 0.0
-        if d <= 1e-6:
-            return 1.0
-        ax = slot_x - ship_x
-        ay = slot_y - ship_y
-        axis_norm = math.hypot(ax, ay)
-        if axis_norm <= 1e-6:
-            return 0.0
-        e_x = ax / axis_norm
-        e_y = ay / axis_norm
-        r_x = tx - slot_x
-        r_y = ty - slot_y
-        a = r_x * e_x + r_y * e_y
-        if a < -axial_slack_m:
-            return 0.0
-        lat = math.hypot(r_x - a * e_x, r_y - a * e_y)
-        lat_n = lat / max(half_width_m, 1e-6)
-        if lat_n >= 1.0:
-            lat_gate = 0.0
-        elif lat_n <= 0.0:
-            lat_gate = 1.0
-        else:
-            u = 1.0 - lat_n
-            lat_gate = u * u * (3.0 - 2.0 * u)
-        return float(lat_gate)
+        gate, _lat_n = cls._corridor_metrics(
+            tx, ty, slot_x, slot_y, ship_x, ship_y, d,
+            hold_start_m, half_width_m, axial_slack_m,
+        )
+        return gate
 
     @staticmethod
     def _ship_soft_scale(corridor_gate: float, s_min: float) -> float:
@@ -118,12 +146,14 @@ class FormationRewardComputer:
             "r_total": np.zeros(n, dtype=np.float32),
             "r_dist": np.zeros(n, dtype=np.float32),
             "r_hold": np.zeros(n, dtype=np.float32),
+            "r_safe": np.zeros(n, dtype=np.float32),
             "r_velocity": np.zeros(n, dtype=np.float32),
             "r_team": np.zeros(n, dtype=np.float32),
             "p_distance": np.zeros(n, dtype=np.float32),
             "p_collision": np.zeros(n, dtype=np.float32),
             "p_ship_collision": np.zeros(n, dtype=np.float32),
             "p_tug_collision": np.zeros(n, dtype=np.float32),
+            "progress_risk": np.zeros(n, dtype=np.float32),
             "dist_to_slot": np.zeros(n, dtype=np.float32),
             "heading_err_deg": np.zeros(n, dtype=np.float32),
             "speed_err": np.zeros(n, dtype=np.float32),
@@ -140,12 +170,15 @@ class FormationRewardComputer:
         # --- config extraction ---
         w_dist = float(getattr(cfg, "reward_dist_w", 1.0))
         distance_cost_w = max(float(getattr(cfg, "reward_distance_cost_w", 0.2)), 0.0)
+        w_safe = float(getattr(cfg, "reward_safe_w", 0.0))
         w_hold = float(getattr(cfg, "reward_hold_w", 1.0))
         w_vel = float(getattr(cfg, "reward_velocity_w", 0.25))
         w_coll = float(getattr(cfg, "reward_collision_w", 3.0))
         collision_cap = float(getattr(cfg, "reward_collision_cap", 1.5))
         progress_clip = max(float(getattr(cfg, "reward_dist_progress_clip_m", 1.0)), 1e-6)
         distance_scale = max(float(getattr(cfg, "reward_dist_scale_m", 200.0)), 1e-6)
+        progress_risk_gate = max(float(getattr(cfg, "reward_progress_risk_gate", 0.5)), 1e-6)
+        safe_closing_vref = max(float(getattr(cfg, "reward_safe_closing_speed_mps", 1.0)), 1e-6)
         target_tol = max(float(cfg.pos_tol_m), 1e-6)
         hold_start_m = max(float(getattr(cfg, "reward_hold_start_m", 120.0)), 1e-6)
 
@@ -207,8 +240,12 @@ class FormationRewardComputer:
                     future_tug_x, future_tug_y, future_ship_x, future_ship_y, future_ship_psi,
                 )
                 p_ship_cpa = self._cpa_risk(ship_dcpa_hull, ship_tcpa, cfg.ship_collision_dist_m, ship_safe_dist, cpa_horizon_s)
-            p_ship = p_ship_prox + cpa_w * p_ship_cpa
-            c_gate = self._corridor_gate(
+            p_ship_raw = p_ship_prox + cpa_w * p_ship_cpa
+            rho = float(np.clip(p_ship_raw / progress_risk_gate, 0.0, 1.0))
+            if r_dist > 0.0:
+                r_dist = r_dist * (1.0 - rho)
+
+            c_gate, lat_n = self._corridor_metrics(
                 tug.x,
                 tug.y,
                 float(slot[0]),
@@ -221,7 +258,21 @@ class FormationRewardComputer:
                 corridor_axial_slack,
             )
             soft = self._ship_soft_scale(c_gate, ship_soft_min)
-            p_ship *= soft
+            p_ship = p_ship_raw * soft
+
+            s_axial = float(np.clip((float(episode.prev_dist[i]) - d) / progress_clip, 0.0, 1.0))
+            s_lat = 1.0 - self._smoothstep01(lat_n)
+            u_x = float(state.ship.x) - tug.x
+            u_y = float(state.ship.y) - tug.y
+            u_n = math.hypot(u_x, u_y)
+            if u_n <= 1e-6:
+                s_approach = 1.0
+            else:
+                closing = max(0.0, tug_vx_w * (u_x / u_n) + tug_vy_w * (u_y / u_n))
+                s_approach = float(np.clip(1.0 - closing / safe_closing_vref, 0.0, 1.0))
+            r_safe = c_gate * (1.0 - target_gate) * (
+                0.5 * s_axial + 0.3 * s_lat + 0.2 * s_approach
+            )
 
             p_tug_prox = 0.0
             p_tug_cpa = 0.0
@@ -243,6 +294,7 @@ class FormationRewardComputer:
             r_total = (
                 w_dist * r_dist
                 - distance_cost_w * p_distance
+                + w_safe * r_safe
                 + w_hold * r_hold
                 + w_vel * r_vel
                 - w_coll * p_coll
@@ -259,11 +311,13 @@ class FormationRewardComputer:
             comp["r_total"][i] = r_total
             comp["r_dist"][i] = r_dist
             comp["r_hold"][i] = r_hold
+            comp["r_safe"][i] = r_safe
             comp["r_velocity"][i] = r_vel
             comp["p_distance"][i] = p_distance
             comp["p_collision"][i] = p_coll
             comp["p_ship_collision"][i] = p_ship
             comp["p_tug_collision"][i] = p_tug
+            comp["progress_risk"][i] = rho
             comp["dist_to_slot"][i] = d
             comp["heading_err_deg"][i] = math.degrees(abs(dpsi))
             comp["speed_err"][i] = speed_err

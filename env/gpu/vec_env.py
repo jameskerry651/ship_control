@@ -88,18 +88,32 @@ class CudaVecEnv:
         self.episode_lengths[:] = 0
         return np.stack(obs_list, axis=0)
 
+    def reset_at(self, indices: np.ndarray | list[int], seeds: list[int]) -> list[np.ndarray]:
+        """Reset a subset of envs with explicit seeds (for GPU eval scheduling)."""
+        if len(indices) != len(seeds):
+            raise ValueError("indices and seeds must have the same length")
+        out: list[np.ndarray] = []
+        for env_idx_raw, episode_seed in zip(indices, seeds):
+            env_idx = int(env_idx_raw)
+            obs = reset_env(self.envs[env_idx], self.batch, env_idx, seed=int(episode_seed))
+            self._fast.reset_from_env(self.envs[env_idx], env_idx)
+            self.episode_returns[env_idx] = 0.0
+            self.episode_lengths[env_idx] = 0
+            out.append(obs)
+        return out
+
     def get_global_state(self) -> np.ndarray:
         return self._fast.build_global_state_batched().cpu().numpy()
 
     def get_global_state_tensor(self) -> torch.Tensor:
         return self._fast.build_global_state_batched()
 
-    def step(self, actions: np.ndarray | torch.Tensor):
+    def step(self, actions: np.ndarray | torch.Tensor, *, auto_reset: bool = True):
         # The float64 CPU backend is an explicit oracle mode used by parity
         # tests.  It intentionally keeps the old scalar FormationEnv semantics;
         # CUDA (and float32 CPU experiments) always take the device fast path.
         if self.device.type == "cpu" and self.dtype == torch.float64:
-            return self._step_parity_cpu(actions)
+            return self._step_parity_cpu(actions, auto_reset=auto_reset)
         if isinstance(actions, torch.Tensor):
             actions_t = actions.to(device=self.device, dtype=self.dtype).clamp(-1.0, 1.0)
         else:
@@ -172,11 +186,12 @@ class CudaVecEnv:
                         "final_dist_mean": float(component_np["dist_to_slot"][i].mean()),
                     }
                 )
-                # CPU reset sampling is intentional; it is outside the hot path.
-                all_obs[i] = reset_env(self.envs[i], self.batch, i, seed=None)
-                self._fast.reset_from_env(self.envs[i], i)
-                self.episode_returns[i] = 0.0
-                self.episode_lengths[i] = 0
+                if auto_reset:
+                    # CPU reset sampling is intentional; it is outside the hot path.
+                    all_obs[i] = reset_env(self.envs[i], self.batch, i, seed=None)
+                    self._fast.reset_from_env(self.envs[i], i)
+                    self.episode_returns[i] = 0.0
+                    self.episode_lengths[i] = 0
 
         return (
             all_obs,
@@ -190,7 +205,9 @@ class CudaVecEnv:
             terminal_global,
         )
 
-    def _step_parity_cpu(self, actions: np.ndarray | torch.Tensor):
+    def _step_parity_cpu(
+        self, actions: np.ndarray | torch.Tensor, *, auto_reset: bool = True
+    ):
         """Reference implementation retained for deterministic L2 parity."""
         actions_np = (
             actions.detach().cpu().numpy() if isinstance(actions, torch.Tensor) else np.asarray(actions)
@@ -230,10 +247,11 @@ class CudaVecEnv:
                 )
                 terminal_obs_local[i] = obs
                 terminal_global[i] = env.get_global_state()
-                obs = reset_env(env, self.batch, i, seed=None)
-                self._fast.reset_from_env(env, i)
-                self.episode_returns[i] = 0.0
-                self.episode_lengths[i] = 0
+                if auto_reset:
+                    obs = reset_env(env, self.batch, i, seed=None)
+                    self._fast.reset_from_env(env, i)
+                    self.episode_returns[i] = 0.0
+                    self.episode_lengths[i] = 0
             else:
                 pull_env_to_gpu(env, self.batch, i)
             all_obs[i], all_rew[i], all_done[i] = obs, reward, done

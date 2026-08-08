@@ -51,19 +51,22 @@ class EnvConfig:
     ship_collision_dist_m: float = 6.0
 
     # ---------- 奖励 ----------
-    # R = w_dist*R_progress - w_distance*C_distance + w_hold*R_hold
-    #     + w_vel*R_vel - w_coll*P_coll + R_team
+    # R = w_p*R_progress_gated - w_d*C_distance + w_s*R_safe + w_h*R_hold
+    #     + w_vel*R_vel - w_c*P_coll + R_team
     reward_dist_w: float = 3.0
     reward_distance_cost_w: float = 0.2
-    reward_hold_w: float = 2.0
+    reward_safe_w: float = 2.0
+    reward_hold_w: float = 3.0
     reward_velocity_w: float = 0.0
-    reward_collision_w: float = 1.0
-    reward_collision_cap: float = 2.0
+    reward_collision_w: float = 2.0
+    reward_collision_cap: float = 4.0
 
     # 距离/目标切换
     reward_dist_progress_clip_m: float = 1.0
     reward_dist_scale_m: float = 200.0
     reward_hold_start_m: float = 150.0  # collision-corridor range only
+    reward_progress_risk_gate: float = 0.5
+    reward_safe_closing_speed_mps: float = 1.0
 
     # 碰撞
     reward_collision_ship_safe_m: float = 80.0
@@ -74,7 +77,7 @@ class EnvConfig:
     # 进槽走廊软化（仅船软碰）
     reward_corridor_half_width_m: float = 40.0
     reward_corridor_axial_slack_m: float = 30.0
-    reward_ship_soft_min_scale: float = 0.15
+    reward_ship_soft_min_scale: float = 0.70
 
     # Compatibility-only switch; legacy shaping is no longer computed.
     reward_shape_w: float = 0.0
@@ -84,18 +87,49 @@ class EnvConfig:
     reward_team_softmin_beta: float = 4.0
 
     # 终端
-    reward_arrival_bonus: float = 80.0
-    reward_collision_pen: float = 80.0
-    reward_collision_pen_culprit: float = 80.0
-    reward_collision_pen_bystander: float = 15.0
+    reward_arrival_bonus: float = 120.0
+    reward_collision_pen: float = 160.0
+    reward_collision_pen_culprit: float = 160.0
+    reward_collision_pen_bystander: float = 30.0
 
     # 观测
     obs_history_k: int = 3
     obs_ship_preview_times_s: tuple[float, float, float] = (5.0, 10.0, 15.0)
 
 
-# 奖励超参 preset 骨架：旧 rw_* 消融已移除；新筛选协议在此注册 id → 字段覆盖。
-REWARD_PRESETS: dict[str, dict[str, float]] = {}
+# 奖励超参 preset：rsc_* 奖励尺度碰撞消融（见 reward-scale-collision-ablation design）。
+REWARD_PRESETS: dict[str, dict[str, float]] = {
+    "rsc_baseline": {
+        "reward_dist_w": 3.0,
+        "reward_collision_cap": 2.0,
+        "reward_ship_soft_min_scale": 0.15,
+    },
+    "rsc_dist_soft": {
+        "reward_dist_w": 1.5,
+        "reward_collision_cap": 2.0,
+        "reward_ship_soft_min_scale": 0.15,
+    },
+    "rsc_coll_mid": {
+        "reward_dist_w": 3.0,
+        "reward_collision_cap": 4.0,
+        "reward_ship_soft_min_scale": 0.15,
+    },
+    "rsc_coll_hi": {
+        "reward_dist_w": 3.0,
+        "reward_collision_cap": 6.0,
+        "reward_ship_soft_min_scale": 0.15,
+    },
+    "rsc_balanced": {
+        "reward_dist_w": 1.5,
+        "reward_collision_cap": 4.0,
+        "reward_ship_soft_min_scale": 0.15,
+    },
+    "rsc_corridor_hard": {
+        "reward_dist_w": 3.0,
+        "reward_collision_cap": 2.0,
+        "reward_ship_soft_min_scale": 0.50,
+    },
+}
 
 
 def list_reward_presets() -> list[str]:
@@ -131,7 +165,7 @@ class PPOConfig:
     # 默认面向 RTX 3090 级 GPU 批仿真扫参峰值（弱机器请 CLI 下调）
     rollout_steps: int = 128
     num_envs: int = 12288
-    minibatch_size: int = 65536
+    minibatch_size: int = 65536/4
     update_epochs: int = 4
     # sync | subproc | cuda；默认 cuda 批动力学（需 --device cuda）
     env_backend: str = "cuda"
@@ -140,7 +174,7 @@ class PPOConfig:
     lr_anneal: bool = True
     lr_min_factor: float = 0.05
     # 与大 num_envs 配套：约 50M / (128×12288×4) ≈ 8 个 PPO update
-    total_steps: int = 50_000_000
+    total_steps: int = 10_000_000
 
     # Actor 时序架构：mlp | transformer（gru/lstm 预留）
     actor_arch: str = "mlp"
@@ -159,6 +193,47 @@ class PPOConfig:
     eval_workers: int = 32
     device: str = "cuda"
     seed: int = 42
+
+
+# Transformer actor 规模 preset（仅覆盖 tf_*；见 docs/tf_scale_ablation.md）
+TF_SIZE_PRESETS: dict[str, dict[str, int]] = {
+    "S": {
+        "tf_d_model": 64,
+        "tf_nhead": 4,
+        "tf_num_layers": 2,
+        "tf_ffn_dim": 128,
+    },
+    "M": {
+        "tf_d_model": 128,
+        "tf_nhead": 4,
+        "tf_num_layers": 3,
+        "tf_ffn_dim": 256,
+    },
+    "L": {
+        "tf_d_model": 256,
+        "tf_nhead": 8,
+        "tf_num_layers": 4,
+        "tf_ffn_dim": 512,
+    },
+}
+
+
+def list_tf_size_presets() -> list[str]:
+    return sorted(TF_SIZE_PRESETS)
+
+
+def apply_tf_size_preset(ppo_cfg: PPOConfig, size_id: str | None) -> str | None:
+    if size_id is None:
+        return None
+    key = str(size_id).strip().upper()
+    if not key:
+        return None
+    if key not in TF_SIZE_PRESETS:
+        known = ", ".join(list_tf_size_presets())
+        raise ValueError(f"Unknown tf size preset {size_id!r}. Known: {known}")
+    for field_name, value in TF_SIZE_PRESETS[key].items():
+        setattr(ppo_cfg, field_name, int(value))
+    return key
 
 
 # ---------- 可视化 ----------

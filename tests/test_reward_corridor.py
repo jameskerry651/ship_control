@@ -50,9 +50,10 @@ def test_corridor_softens_ship_penalty_on_radial_approach() -> None:
 
     comp = _comp(env)
     assert float(comp["corridor_gate"][0]) > 0.5
-    assert float(comp["ship_soft_scale"][0]) < 0.5
+    assert float(comp["ship_soft_scale"][0]) < 1.0
     expected = 1.0 - (1.0 - env.cfg.reward_ship_soft_min_scale) * float(comp["corridor_gate"][0])
     assert float(comp["ship_soft_scale"][0]) == pytest.approx(expected, abs=1e-5)
+    assert float(comp["ship_soft_scale"][0]) >= env.cfg.reward_ship_soft_min_scale - 1e-5
 
 
 def test_outside_corridor_keeps_full_ship_soft_scale() -> None:

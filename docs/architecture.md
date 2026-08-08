@@ -15,11 +15,11 @@
 ## 2. 分层与依赖
 
 ```
-scripts/          train.py · visualize.py · export_maneuver_videos.py
-rl/               Actor / Critic / PPO / temporal
+scripts/          train.py · visualize.py · run_tf_scale_ablation.py · summarize_tf_scale.py · run_reward_scale_ablation.py · summarize_reward_scale.py · export_maneuver_videos.py
+rl/               Actor / Critic / PPO / temporal · reward_scale_ablation helpers
 env/              FormationEnv · Observer · Reward · init · obs_spec · state
 physics/          TugboatDynamicsModel · LargeShipModel
-config.py         EnvConfig · PPOConfig · VizConfig · REWARD_PRESETS（骨架）
+config.py         EnvConfig · PPOConfig · VizConfig · REWARD_PRESETS（rsc_*）· TF_SIZE_PRESETS
 simulator/        独立手动仿真（仅依赖 physics）
 ```
 
@@ -73,17 +73,21 @@ simulator → physics only
 | `rl/critic.py` | 集中式 Critic + PopArt + agent one-hot |
 | `rl/ppo.py` | Rollout buffer、GAE、`mappo_update` |
 
-架构切换：`--arch mlp|transformer`（见 [arch_ablation.md](arch_ablation.md)）。
+架构切换：`--arch mlp|transformer`（见 [arch_ablation.md](arch_ablation.md)）。  
+规模切换：`--tf-size S|M|L`（见 [tf_scale_ablation.md](tf_scale_ablation.md)）。  
+奖励尺度扫描：`--reward-preset rsc_*`（见 [reward_scale_ablation.md](reward_scale_ablation.md)）。  
+安全进槽奖励：风险门控接近 + `R_safe`（见 [reward_function.md](reward_function.md) / [safe-slot design](superpowers/specs/2026-08-08-safe-slot-approach-reward-design.md)）。
 
 ## 5. 训练入口 `scripts/train.py`
 
 - 向量化：默认 `cuda` + `num_envs=12288` + `minibatch_size=65536`（RTX 3090 扫参峰值；可用 `--env-backend sync|subproc` 覆盖）
 - `cuda`：[`env/gpu/CudaVecEnv`](../env/gpu/vec_env.py) + [`batched_step`](../env/gpu/batched_step.py)。设计见 [gpu-parallel-env-design](superpowers/specs/2026-08-07-gpu-parallel-env-design.md)
-- 设备：默认 `cuda`；评估默认 `eval_workers=32`（CPU env + 主进程策略推理）
+- 设备：默认 `cuda`；评估默认 `--eval-backend cuda`（`CudaVecEnv` 批仿真 + 同卡策略推理；`--eval-backend cpu` 可回退 FormationEnv / 子进程）
+- CLI：`--eval-backend cpu|cuda`、`--eval-workers`（并行评估宽度）
 - 奖励 RunningMeanStd 归一化（稠密）+ 终端奖罚原尺度叠加
 - TensorBoard 核心曲线（见 [tensorboard_metrics.md](tensorboard_metrics.md)）
 - 按 eval `success_rate` 优先存 `best.pt`；定期 `last.pt`
-- CLI：`--arch`、`--init-radius`、`--reward-preset`、`--env-backend`（见 [arch_ablation.md](arch_ablation.md)；preset 映射见 `config.REWARD_PRESETS`）
+- CLI：`--arch`、`--tf-size`、`--init-radius`、`--reward-preset`、`--env-backend`、`--eval-backend`（见 [arch_ablation.md](arch_ablation.md) / [tf_scale_ablation.md](tf_scale_ablation.md) / [reward_scale_ablation.md](reward_scale_ablation.md)；preset 映射见 `config.REWARD_PRESETS` / `TF_SIZE_PRESETS`）
 
 ## 6. 测试（与文档相关）
 
@@ -91,6 +95,7 @@ simulator → physics only
 |------|------|
 | `tests/parity/` | CPU vs batched/CudaVecEnv 数值与事件对照（L0–L2） |
 | `tests/test_actor_arch.py` | mlp / transformer 工厂与形状 |
+| `tests/test_tf_size_presets.py` | `TF_SIZE_PRESETS` / `apply_tf_size_preset` 与参数量带 |
 | `tests/test_track_phase.py` | Capture / Track 终止 |
 | `tests/test_observation_spec.py` | ObservationSpec 契约 |
 | `tests/test_attention.py` | 邻居 Attention |

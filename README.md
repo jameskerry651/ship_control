@@ -21,6 +21,8 @@
 | [docs/observation_space.md](docs/observation_space.md) | 观测 / 全局状态 |
 | [docs/reward_function.md](docs/reward_function.md) | 奖励函数 |
 | [docs/arch_ablation.md](docs/arch_ablation.md) | Actor 时序架构对比实验 |
+| [docs/tf_scale_ablation.md](docs/tf_scale_ablation.md) | Transformer 规模消融 |
+| [docs/reward_scale_ablation.md](docs/reward_scale_ablation.md) | 奖励尺度碰撞消融 |
 | [docs/tensorboard_metrics.md](docs/tensorboard_metrics.md) | TensorBoard 指标含义 |
 
 ## 对比实验（Actor 时序）
@@ -40,6 +42,17 @@ python scripts/train.py --arch mlp --run-name mlp_r120
 ```
 
 奖励超参可用 `--reward-preset`（映射在 `config.REWARD_PRESETS`；当前为空骨架，待新筛选协议注册）。
+
+Transformer 容量快筛见 [docs/tf_scale_ablation.md](docs/tf_scale_ablation.md)：
+
+```bash
+python scripts/train.py --arch transformer --tf-size M \
+  --init-radius 120 --slot-assignment minimax \
+  --env-backend cuda --num-envs 12288 --rollout-steps 128 \
+  --minibatch-size 65536 --total-steps 50000000 \
+  --run-name tf_scale_M_r120 --seed 42
+# 或：python scripts/run_tf_scale_ablation.py
+```
 
 ## 目录结构
 

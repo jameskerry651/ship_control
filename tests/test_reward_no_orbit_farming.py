@@ -17,6 +17,8 @@ def _isolated_env(*, team_w: float = 0.0) -> FormationEnv:
     cfg.reward_collision_w = 0.0
     cfg.reward_velocity_w = 0.0
     cfg.reward_team_w = team_w
+    cfg.reward_progress_risk_gate = 1e9  # ρ ≈ 0
+    cfg.reward_safe_w = 0.0
     env = FormationEnv(cfg=cfg, seed=17)
     env.reset()
     env.ship.x = 0.0
@@ -95,7 +97,7 @@ def test_target_center_hold_is_positive() -> None:
     comp = _components(env, [0.0, 400.0, 450.0, 500.0])
     assert float(comp["p_distance"][0]) == pytest.approx(0.0)
     assert float(comp["r_hold"][0]) == pytest.approx(1.0)
-    assert float(comp["r_total"][0]) == pytest.approx(2.0)
+    assert float(comp["r_total"][0]) == pytest.approx(env.cfg.reward_hold_w)
 
 
 def test_team_cost_tracks_the_lagging_tug() -> None:

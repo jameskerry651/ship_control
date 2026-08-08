@@ -1,8 +1,8 @@
 # Transformer Actor 规模消融设计
 
 日期：2026-08-07  
-状态：已批准，待实现  
-范围：增加 `tf_S/M/L` 规模 preset 与训练 CLI；短跑 1M 对照；汇总读结果。不改奖励、不扩 critic、不调 LR 网格。
+状态：已实现  
+范围：增加 `tf_S/M/L` 规模 preset 与训练 CLI；在 **cuda 吞吐默认栈** 上对照；汇总读结果。不改奖励、不扩 critic、不调 LR 网格。
 
 ## 1. 背景与目标
 
@@ -12,7 +12,7 @@
 
 成功标准（快筛）：
 
-1. 三档均可训满 1M，日志/ckpt 记录规模超参与参数量；
+1. 三档均可训满预算步数，日志/ckpt 记录规模超参与参数量；
 2. 汇总表可对比 `final_dist` / collision / capture；
 3. 人工判定：距离随规模明显下降或出现非零 capture → 优胜档可加长训；三档仍远且 capture=0 → 容量非主瓶颈，回到奖励/init。
 
@@ -20,9 +20,9 @@
 
 | 决策 | 选择 |
 |------|------|
-| 预算 | 快筛：各 1M steps |
+| 预算 | 快筛：各 50M steps（与现行 `PPOConfig.total_steps` 对齐，约 7–8 次 PPO update） |
 | 扩参方式 | 宽+深阶梯（S/M/L） |
-| 固定条件 | 对齐当前主跑：r120 + minimax + 新奖励默认 |
+| 固定条件 | r120 + minimax + 新奖励默认；并行对齐现行 cuda 吞吐默认 |
 | 扩谁 | 仅 actor TF；critic 默认不动 |
 | 对照 | 同 seed、同并行默认；每档独立 run |
 
@@ -35,9 +35,16 @@
 | `--slot-assignment` | `minimax` |
 | 奖励 | EnvConfig 现行默认；无 `--reward-preset` |
 | `--seed` | `42` |
-| `--total-steps` | `1000000` |
-| 并行默认 | `num_envs=16`、`env-backend=subproc`、`device=cuda`（CLI 可覆盖） |
+| `--total-steps` | `50000000` |
+| `--env-backend` | `cuda` |
+| `--num-envs` | `12288` |
+| `--rollout-steps` | `128` |
+| `--minibatch-size` | `65536` |
+| `--device` | `cuda` |
+| 每 update 样本 | `128 × 12288 × 4 = 6,291,456`（约 7–8 次 update / 50M） |
 | Checkpoint | 不 resume；每档独立 `--run-name` |
+
+> 说明：若某档（尤其 `tf_L`）显存不足，三档同步下调同一 `num_envs`（如 8192），禁止只改一档。弱机器勿用本协议默认，应另开 `subproc` 小并行协议。
 
 ## 4. 规模表
 
@@ -104,8 +111,12 @@ python scripts/train.py \
   --tf-size M \
   --init-radius 120 \
   --slot-assignment minimax \
+  --env-backend cuda \
+  --num-envs 12288 \
+  --rollout-steps 128 \
+  --minibatch-size 65536 \
+  --total-steps 50000000 \
   --run-name tf_scale_M_r120 \
-  --total-steps 1000000 \
   --seed 42
 ```
 
@@ -115,3 +126,7 @@ python scripts/train.py \
 python scripts/run_tf_scale_ablation.py
 python scripts/run_tf_scale_ablation.py --dry-run
 ```
+
+## 10. 修订（2026-08-07）
+
+并行栈从 `subproc` + `num_envs=16` + 1M 步，改为现行 cuda 吞吐默认（`cuda` / `12288` / `minibatch=65536` / `rollout=128` / `50M` steps），以保证大 batch 下仍有多次 PPO update，并与主训练路径一致。

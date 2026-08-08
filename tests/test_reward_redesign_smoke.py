@@ -11,8 +11,10 @@ REQUIRED = {
     "r_dist",
     "p_distance",
     "r_hold",
+    "r_safe",
     "r_team",
     "p_collision",
+    "progress_risk",
     "corridor_gate",
     "ship_soft_scale",
 }
@@ -31,4 +33,9 @@ def test_reward_redesign_smoke_step() -> None:
             assert np.isfinite(np.asarray(comp[k], dtype=np.float64)).all()
         assert np.isfinite(rew).all()
     assert env.cfg.ship_collision_dist_m == 6.0
-    assert env.cfg.reward_arrival_bonus == 80.0
+    assert env.cfg.reward_arrival_bonus == 120.0
+    assert env.cfg.reward_collision_w == 2.0
+    assert env.cfg.reward_collision_cap == 4.0
+    assert env.cfg.reward_ship_soft_min_scale == 0.70
+    assert env.cfg.reward_safe_w == 2.0
+    assert env.cfg.reward_progress_risk_gate == 0.5

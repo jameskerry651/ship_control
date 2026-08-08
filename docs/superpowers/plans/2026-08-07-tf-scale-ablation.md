@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 提供 `--tf-size {S,M,L}` 与串行消融脚本，在固定 r120+minimax 条件下用 1M steps 快筛 actor Transformer 容量对任务指标的影响。
+**Goal:** 提供 `--tf-size {S,M,L}` 与串行消融脚本，在固定 r120+minimax 与 cuda 吞吐默认栈下用 50M steps 快筛 actor Transformer 容量对任务指标的影响。
 
 **Architecture:** 在 `config.py` 集中 `TF_SIZE_PRESETS` 与 `apply_tf_size_preset`；`train.py` 在构造 `PPOConfig`/actor 前应用并打日志写入 hparams/ckpt；可选 runner + summarize 产出对照表；单测锁定 preset 与参数量量级。
 
@@ -13,7 +13,7 @@
 - 规格：`docs/superpowers/specs/2026-08-07-tf-scale-ablation-design.md`。
 - Preset 键固定：`S` / `M` / `L`（CLI 输入规范化为大写）。
 - 规模表必须与设计一致：S=`64/4/2/128`，M=`128/4/3/256`，L=`256/8/4/512`（字段顺序：d_model, nhead, layers, ffn）。
-- 固定筛选条件：`--arch transformer`、`--init-radius 120`、`--slot-assignment minimax`、`--total-steps 1000000`、`--seed 42`；无 reward-preset。
+- 固定筛选条件：`--arch transformer`、`--init-radius 120`、`--slot-assignment minimax`、`--env-backend cuda`、`--num-envs 12288`、`--rollout-steps 128`、`--minibatch-size 65536`、`--total-steps 50000000`、`--seed 42`；无 reward-preset。Runner 必须显式传上述并行/预算参数，勿 silent 依赖全局默认漂移。
 - 只改 actor 的 `tf_*`；不改 critic、不改奖励。
 - 非法 `--tf-size` 必须报错并列出合法 id。
 
@@ -335,11 +335,13 @@ ORDER = ["S", "M", "L"]
 def main() -> int:
     p = argparse.ArgumentParser(description="串行跑 TF 规模消融")
     p.add_argument("--sizes", nargs="+", default=ORDER, choices=ORDER)
-    p.add_argument("--total-steps", type=int, default=1_000_000)
+    p.add_argument("--total-steps", type=int, default=50_000_000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--env-backend", type=str, default="subproc")
-    p.add_argument("--num-envs", type=int, default=16)
+    p.add_argument("--env-backend", type=str, default="cuda")
+    p.add_argument("--num-envs", type=int, default=12288)
+    p.add_argument("--rollout-steps", type=int, default=128)
+    p.add_argument("--minibatch-size", type=int, default=65536)
     p.add_argument("--eval-workers", type=int, default=1)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--skip-summarize", action="store_true")
@@ -365,6 +367,8 @@ def main() -> int:
             "--device", args.device,
             "--env-backend", args.env_backend,
             "--num-envs", str(args.num_envs),
+            "--rollout-steps", str(args.rollout_steps),
+            "--minibatch-size", str(args.minibatch_size),
             "--eval-workers", str(args.eval_workers),
         ])
 
@@ -504,7 +508,9 @@ git commit -m "feat(scripts): add TF scale ablation runner and summarizer"
 ```bash
 python scripts/train.py --arch transformer --tf-size M \
   --init-radius 120 --slot-assignment minimax \
-  --run-name tf_scale_M_r120 --total-steps 1000000 --seed 42
+  --env-backend cuda --num-envs 12288 --rollout-steps 128 \
+  --minibatch-size 65536 --total-steps 50000000 \
+  --run-name tf_scale_M_r120 --seed 42
 ```
 
 - [ ] **Step 3: architecture.md**
